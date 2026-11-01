@@ -1,0 +1,10 @@
+bin/
+tools/*
+!tools/MakeIcon.cs
+*.exe
+
+# Local working notes and clean-room records
+handover.md
+memory.md
+riprendi-dopo-riavvio.md
+cleanroom/
