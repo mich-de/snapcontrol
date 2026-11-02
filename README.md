@@ -1,8 +1,8 @@
 # SnapControl
 
-Version 1.0.0
+Version 1.1.0
 
-A lightweight control panel for the **Lenovo IdeaPad Slim 5 14Q8X9 (83HL)** with **Snapdragon X Plus**, built as an alternative to Lenovo Vantage: native ARM64, no telemetry, a single executable of about 167 KB.
+A lightweight control panel for the **Lenovo IdeaPad Slim 5 14Q8X9 (83HL)** with **Snapdragon X Plus**, built as an alternative to Lenovo Vantage: native ARM64, no telemetry, a single executable of about 187 KB.
 
 Author: **mich-de** — [github.com/mich-de/snapcontrol](https://github.com/mich-de/snapcontrol)
 

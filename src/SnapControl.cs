@@ -14,7 +14,7 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("SnapControl")]
 [assembly: System.Reflection.AssemblyCompany("mich-de")]
 [assembly: System.Reflection.AssemblyCopyright("mich-de - github.com/mich-de/snapcontrol")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
 // Without this attribute .NET 4.8.1 starts AnyCPU apps under x64 emulation even on ARM64.
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8.1", FrameworkDisplayName = ".NET Framework 4.8.1")]
 
