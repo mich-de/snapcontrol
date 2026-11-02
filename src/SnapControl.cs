@@ -310,6 +310,26 @@ namespace SnapControl
                 catch { }
             }
         }
+
+        // Ids of the updates the user marked as possibly incompatible.
+        public static string[] Flagged
+        {
+            get
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(Key)) return (k == null ? null : k.GetValue("FlaggedDrivers") as string[]) ?? new string[0]; }
+                catch { return new string[0]; }
+            }
+            set
+            {
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Key))
+                        if (value.Length > 0) k.SetValue("FlaggedDrivers", value, Microsoft.Win32.RegistryValueKind.MultiString);
+                        else k.DeleteValue("FlaggedDrivers", false);
+                }
+                catch { }
+            }
+        }
     }
 
     // "Never sleep" checkbox: no sleep/hibernate on idle and Wi-Fi always connected
@@ -662,7 +682,7 @@ namespace SnapControl
                 for (int i = 0; i < result.Updates.Count; i++)
                 {
                     dynamic u = result.Updates.Item(i);
-                    var it = new UpdateItem { Id = (string)u.Identity.UpdateID, Title = (string)u.Title, Provider = (string)u.DriverProvider, Source = "WINDOWS UPDATE" };
+                    var it = new UpdateItem { Id = (string)u.Identity.UpdateID, Title = (string)u.Title, Provider = (string)u.DriverProvider, Source = "WINDOWS UPDATE", Url = MsCatalog.SearchUrl((string)u.Title) };
                     try { it.Date = ((DateTime)u.DriverVerDate).ToString("yyyy-MM-dd"); } catch { it.Date = ""; }
                     res.Add(it);
                 }
@@ -755,6 +775,14 @@ namespace SnapControl
                 return Title + "  (" + L.T("installed ", "installato ") + Inst + (string.IsNullOrEmpty(By) ? "" : " · " + L.T("by ", "di ") + By) + ")";
             }
         }
+
+        // Prefilled GitHub issue, always in English: nothing is sent until the user submits it on GitHub.
+        public string IssueUrl(string machine, string windows, string app)
+        {
+            string body = "**Driver:** " + Title + "\n**Source:** " + Source + "\n**Package:** " + Url + "\n**Installed version:** " + (Inst ?? "unknown")
+                + "\n**Date:** " + Date + "\n**Machine type:** " + machine + "\n**Windows:** " + windows + "\n**SnapControl:** " + app + "\n\n**What goes wrong:**\n";
+            return "https://github.com/mich-de/snapcontrol/issues/new?title=" + Uri.EscapeDataString("Possibly incompatible driver: " + Title) + "&body=" + Uri.EscapeDataString(body);
+        }
     }
 
     // Microsoft Update Catalog: ARM64 drivers newer than the installed ones that Windows Update does not offer,
@@ -766,6 +794,9 @@ namespace SnapControl
     {
         public const string Source = "CATALOGO MS";
         const string Base = "https://www.catalog.update.microsoft.com/";
+
+        // Search page: one row per package, with its Download button.
+        public static string SearchUrl(string q) { return Base + "Search.aspx?q=" + Uri.EscapeDataString(q); }
 
         sealed class Dev
         {
@@ -901,7 +932,7 @@ namespace SnapControl
                 string date = DateTime.TryParse(c.Value[1], System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out d) ? d.ToString("yyyy-MM-dd") : "";
                 return new UpdateItem
                 {
-                    Id = "cat:" + id, Provider = company, Date = date, Source = Source, Url = url,
+                    Id = "cat:" + id, Provider = company, Date = date, Source = Source, Url = SearchUrl(id),
                     Title = dev.Name + "  " + c.Key, Inst = inst.ToString(), By = company
                 };
             }
@@ -1708,6 +1739,7 @@ namespace SnapControl
         bool wuBusy, installing;
         List<UpdateItem> updates;                              // null = search not done yet
         readonly HashSet<string> selected = new HashSet<string>();
+        readonly HashSet<string> flagged = new HashSet<string>(Settings.Flagged);
         SocSample soc;
         List<string[]> qcRows;
         bool socBusy;
@@ -2008,7 +2040,7 @@ namespace SnapControl
                     updates = res;
                     selected.Clear();
                     // catalog drivers (from other OEMs) are not preselected
-                    foreach (var u in res) if (u.Source == "WINDOWS UPDATE") selected.Add(u.Id);
+                    foreach (var u in res) if (u.Source == "WINDOWS UPDATE" && !flagged.Contains(u.Id)) selected.Add(u.Id);
                     drvStatus = () => string.Join(" · ", notes.ConvertAll(n => n()));
                     Invalidate();
                 });
@@ -2666,6 +2698,12 @@ namespace SnapControl
             RefreshBattery();
         }
 
+        void ToggleFlag(string id)
+        {
+            if (!flagged.Remove(id)) { flagged.Add(id); selected.Remove(id); }
+            Settings.Flagged = new List<string>(flagged).ToArray();
+        }
+
         void PaintDrivers(Graphics g, int x, int y, int w, int bottom)
         {
             if (drivers == null) LoadDrivers();
@@ -2678,7 +2716,7 @@ namespace SnapControl
                 bx = PillButton(g, bx, y, label, active, act).Right + Px(8);
             };
             pill(wuBusy ? L.T("SEARCHING…", "RICERCA…") : L.T("CHECK FOR UPDATES", "CERCA AGGIORNAMENTI"), false, busy ? (Action)null : SearchUpdates);
-            var installable = updates == null ? new List<UpdateItem>() : updates.FindAll(u => u.Installable);
+            var installable = updates == null ? new List<UpdateItem>() : updates.FindAll(u => u.Installable && !flagged.Contains(u.Id));
             var chosen = installable.FindAll(u => selected.Contains(u.Id));
             if (installable.Count > 0)
             {
@@ -2698,13 +2736,30 @@ namespace SnapControl
                 Txt(g, L.T("AVAILABLE UPDATES · ", "AGGIORNAMENTI DISPONIBILI · ") + updates.Count, fMonoSmall, T.Accent, new Rectangle(x, y, w, Px(18)));
                 y += Px(24);
                 HLine(g, x, x + w, y, T.LineStrong);
-                int uh = Px(38);
+                int uh = Px(52);
                 foreach (var u in updates)
                 {
                     var row = new Rectangle(x, y, w, uh);
                     if (row == hover) using (var b = new SolidBrush(T.Band)) g.FillRectangle(b, row);
                     var box = new Rectangle(x + Px(4), y + (uh - Px(16)) / 2, Px(16), Px(16));
-                    if (u.Installable)
+                    bool isFlagged = flagged.Contains(u.Id);
+                    // buttons before the row: the first hit area wins
+                    int ax = x + w, ay = y + (uh - Px(34)) / 2;
+                    if (isFlagged)
+                    {
+                        ax -= TxtW("ISSUE ↗", fMono) + Px(20);
+                        PillButton(g, ax, ay, "ISSUE ↗", false, delegate { Open(u.IssueUrl(Lenovo.MachineType(), Environment.OSVersion.Version.ToString(), Application.ProductVersion)); }, 20);
+                        ax -= Px(6);
+                    }
+                    string flagLabel = isFlagged ? L.T("UNFLAG", "RIMUOVI SEGNO") : L.T("FLAG", "SEGNALA");
+                    ax -= TxtW(flagLabel, fMono) + Px(20);
+                    PillButton(g, ax, ay, flagLabel, isFlagged, delegate { ToggleFlag(u.Id); }, 20);
+                    string pkg = L.T("PACKAGE ↗", "PACCHETTO ↗");
+                    ax -= Px(6) + TxtW(pkg, fMono) + Px(20);
+                    PillButton(g, ax, ay, pkg, false, delegate { Open(u.Url); }, 20);
+                    if (isFlagged)
+                        Txt(g, "!", fMonoBold, T.Accent, box, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    else if (u.Installable)
                     {
                         bool on = selected.Contains(u.Id);
                         using (var p = new Pen(on ? T.Accent : T.LineStrong, Px(1.5f))) g.DrawRectangle(p, box);
@@ -2718,9 +2773,9 @@ namespace SnapControl
                         string url = u.Url;
                         Hit(row, delegate { Open(url); });
                     }
-                    Txt(g, u.TitleText, fBody, T.Text, new Rectangle(x + Px(32), y, (int)(w * .62f), uh));
-                    Txt(g, u.SourceText, fMonoSmall, T.Muted, new Rectangle(x + Px(32) + (int)(w * .62f) + Px(10), y, (int)(w * .2f), uh));
-                    Txt(g, u.Date, fMono, T.Muted, new Rectangle(x + w - Px(100), y, Px(100), uh));
+                    int tw = ax - x - Px(42);
+                    Txt(g, u.TitleText, fBody, isFlagged ? T.Muted : T.Text, new Rectangle(x + Px(32), y + Px(4), tw, uh / 2));
+                    Txt(g, (isFlagged ? L.T("MAY BE INCOMPATIBLE · ", "FORSE NON COMPATIBILE · ") : "") + u.SourceText + " · " + u.Date, fMonoSmall, isFlagged ? T.Accent : T.Muted, new Rectangle(x + Px(32), y + uh / 2, tw, uh / 2 - Px(4)));
                     y += uh;
                     HLine(g, x, x + w, y, T.Line);
                 }
