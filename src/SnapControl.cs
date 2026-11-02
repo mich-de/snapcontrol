@@ -46,7 +46,7 @@ namespace SnapControl
         [DllImport("wintrust.dll")]
         static extern int WinVerifyTrust(IntPtr hwnd, ref Guid action, ref WinTrustData data);
 
-        // Authenticode check without UI: the signature matches the file and chains to a trusted root.
+        // Authenticode check without UI: the signature matches the file, chains to a trusted root and is not revoked.
         public static bool SignatureValid(string path)
         {
             var action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");   // WINTRUST_ACTION_GENERIC_VERIFY_V2
@@ -54,7 +54,7 @@ namespace SnapControl
             try
             {
                 Marshal.StructureToPtr(new WinTrustFileInfo { Size = (uint)Marshal.SizeOf(typeof(WinTrustFileInfo)), Path = path }, file, false);
-                var data = new WinTrustData { Size = (uint)Marshal.SizeOf(typeof(WinTrustData)), UiChoice = 2, UnionChoice = 1, FileInfo = file };
+                var data = new WinTrustData { Size = (uint)Marshal.SizeOf(typeof(WinTrustData)), UiChoice = 2, Revocation = 1, UnionChoice = 1, FileInfo = file };
                 return WinVerifyTrust(IntPtr.Zero, ref action, ref data) == 0;
             }
             finally
@@ -500,7 +500,8 @@ namespace SnapControl
     // (power drops to 0 W and does not go negative), BatteryCharge resumes it. Requires an elevated process.
     static class ChargeLimit
     {
-        public const int Stop = 80, Resume = 75;
+        public static readonly int[] Levels = { 50, 80, 85, 90, 95 };
+        public const int Margin = 5;                           // charging resumes this far below the limit
         const string TaskName = "SnapControl Limite carica";
         public const int BatteryCharge = 1, BatteryDischarge = 2;
         const uint IoctlTag = 0x294040, IoctlSet = 0x298048;
@@ -513,16 +514,78 @@ namespace SnapControl
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle h, uint c, byte[] i, int ni, byte[] o, int no, out int r, IntPtr v);
         [StructLayout(LayoutKind.Sequential)] struct Interface { public int Size; public Guid Class; public int Flags; public IntPtr Reserved; }
 
-        static string DataDir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SnapControl"); } }
+        public static string DataDir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SnapControl"); } }
         static string Flag { get { return System.IO.Path.Combine(DataDir, "charge-limit.on"); } }
         public static bool Enabled { get { return System.IO.File.Exists(Flag); } }
 
-        // Command to send, 0 if none. Between Resume and Stop leaves the state as is to avoid constant toggling.
-        public static int Decide(int percent, bool onAc, bool charging)
+        // A SYSTEM task and elevated processes write here. Windows lets any user create this folder and files
+        // in it, so: no reparse point, administrators as owner, and whatever another user left is removed.
+        public static void SecureDataDir()
+        {
+            var admins = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+            var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+            var users = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinUsersSid, null);
+            const System.Security.AccessControl.InheritanceFlags inherit = System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit;
+            var ds = new System.Security.AccessControl.DirectorySecurity();
+            ds.SetOwner(admins);
+            ds.SetAccessRuleProtection(true, false);
+            ds.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(admins, System.Security.AccessControl.FileSystemRights.FullControl, inherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+            ds.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(system, System.Security.AccessControl.FileSystemRights.FullControl, inherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+            ds.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(users, System.Security.AccessControl.FileSystemRights.ReadAndExecute, inherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+
+            var di = new System.IO.DirectoryInfo(DataDir);
+            // the folder of another user may hold handles that keep write access: it is replaced, not reused
+            if (di.Exists && !Trusted(di, admins, system)) { if ((di.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) di.Delete(); else di.Delete(true); di.Refresh(); }
+            if (di.Exists) di.SetAccessControl(ds);
+            else System.IO.Directory.CreateDirectory(DataDir, ds);
+            Sweep(di, admins, system);
+        }
+
+        static bool Trusted(System.IO.FileSystemInfo e, System.Security.Principal.SecurityIdentifier admins, System.Security.Principal.SecurityIdentifier system)
+        {
+            if ((e.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) return false;
+            var dir = e as System.IO.DirectoryInfo;
+            var owner = dir != null ? dir.GetAccessControl(System.Security.AccessControl.AccessControlSections.Owner).GetOwner(typeof(System.Security.Principal.SecurityIdentifier))
+                : ((System.IO.FileInfo)e).GetAccessControl(System.Security.AccessControl.AccessControlSections.Owner).GetOwner(typeof(System.Security.Principal.SecurityIdentifier));
+            return owner == admins || owner == system;
+        }
+
+        static void Sweep(System.IO.DirectoryInfo di, System.Security.Principal.SecurityIdentifier admins, System.Security.Principal.SecurityIdentifier system)
+        {
+            foreach (var e in di.GetFileSystemInfos())
+            {
+                var dir = e as System.IO.DirectoryInfo;
+                if (!Trusted(e, admins, system))
+                {
+                    if (dir == null || (e.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) e.Delete();
+                    else dir.Delete(true);
+                }
+                else if (dir != null) Sweep(dir, admins, system);
+            }
+        }
+
+        // The flag holds the chosen level. Empty, as written by earlier versions, or not valid: 80%.
+        public static int Parse(string s)
+        {
+            int v;
+            return int.TryParse((s ?? "").Trim(), out v) && Array.IndexOf(Levels, v) >= 0 ? v : 80;
+        }
+
+        public static int Stop
+        {
+            get
+            {
+                try { return Parse(System.IO.File.ReadAllText(Flag)); }
+                catch { return Parse(null); }
+            }
+        }
+
+        // Command to send, 0 if none. Between the two thresholds leaves the state as is to avoid constant toggling.
+        public static int Decide(int percent, bool onAc, bool charging, int stop)
         {
             if (percent < 0 || !onAc) return 0;
-            if (charging && percent >= Stop) return BatteryDischarge;
-            if (!charging && percent <= Resume) return BatteryCharge;
+            if (charging && percent >= stop) return BatteryDischarge;
+            if (!charging && percent <= stop - Margin) return BatteryCharge;
             return 0;
         }
 
@@ -565,12 +628,24 @@ namespace SnapControl
         public static void Run()
         {
             string lastError = null;
+            // a failure here must not end the task: charging could stay stopped with nobody to resume it
+            try { SecureDataDir(); }
+            catch (Exception ex) { Log("errore: " + ex.Message); }
+            bool wasOn = true;
             while (true)
             {
                 try
                 {
+                    // no flag means off, whatever started this process: never a limit the window does not show
+                    if (!Enabled)
+                    {
+                        if (wasOn) { Send(BatteryCharge); wasOn = false; }
+                        Thread.Sleep(30000);
+                        continue;
+                    }
+                    wasOn = true;
                     var b = BatteryInfo.Read();
-                    int cmd = Decide(b.Percent, b.OnAc, b.Charging);
+                    int cmd = Decide(b.Percent, b.OnAc, b.Charging, Stop);
                     if (cmd != 0)
                     {
                         Send(cmd);
@@ -589,16 +664,18 @@ namespace SnapControl
 
         static int Schtasks(string args)
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("schtasks.exe", args) { UseShellExecute = false, CreateNoWindow = true };
+            var psi = new System.Diagnostics.ProcessStartInfo(System.IO.Path.Combine(Environment.SystemDirectory, "schtasks.exe"), args) { UseShellExecute = false, CreateNoWindow = true };
             using (var p = System.Diagnostics.Process.Start(psi)) { p.WaitForExit(); return p.ExitCode; }
         }
 
         // Runs elevated. The task runs as SYSTEM: from a user-writable path it would grant privileges to anyone replacing the exe.
-        public static void Enable()
+        public static void Enable(int level)
         {
+            if (Array.IndexOf(Levels, level) < 0) throw new Exception("livello non valido: " + level);
             string exe = Application.ExecutablePath, dir = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) + "\\";
             if (!exe.StartsWith(dir, StringComparison.OrdinalIgnoreCase)) throw new Exception("il limite di carica richiede SnapControl installato in " + dir);
-            System.IO.Directory.CreateDirectory(DataDir);
+            SecureDataDir();
+            int previous = Enabled ? Stop : 0;
             string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
                 + "<Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>"
                 + "<Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
@@ -613,18 +690,55 @@ namespace SnapControl
                 if (code != 0) throw new Exception("schtasks /create ha restituito " + code);
             }
             finally { System.IO.File.Delete(file); }
+            // the flag comes first because the task reads it as soon as it starts; a running task is restarted
+            System.IO.File.WriteAllText(Flag + ".tmp", level.ToString());
+            System.IO.File.Delete(Flag);
+            System.IO.File.Move(Flag + ".tmp", Flag);
+            Schtasks("/end /tn \"" + TaskName + "\"");
+            // /end is not immediate, and with IgnoreNew a /run during the exit would be dropped
+            for (int i = 0; i < 20 && Array.Exists(System.Diagnostics.Process.GetProcessesByName("SnapControl"), p => p.SessionId == 0); i++) Thread.Sleep(250);
             int run = Schtasks("/run /tn \"" + TaskName + "\"");
-            if (run != 0) throw new Exception("schtasks /run ha restituito " + run);
-            System.IO.File.WriteAllText(Flag, "");
+            if (run != 0)
+            {
+                // nothing would watch the battery: back to off, with charging free
+                try { Send(BatteryCharge); } catch { }
+                Schtasks("/delete /f /tn \"" + TaskName + "\"");
+                System.IO.File.Delete(Flag);
+                throw new Exception("schtasks /run ha restituito " + run);
+            }
+            // a higher limit counts at once, even if charging was stopped above the new resume level
+            if (level > previous && previous != 0 && BatteryInfo.Read().OnAc) Send(BatteryCharge);
         }
 
-        // Runs elevated. Charging resumes even if the task is gone, otherwise it would stay stopped.
+        // Runs elevated. If charging cannot be resumed nothing is removed: the limit stays on and the error is shown.
         public static void Disable()
         {
             Schtasks("/end /tn \"" + TaskName + "\"");
+            try { Send(BatteryCharge); }
+            catch { Schtasks("/run /tn \"" + TaskName + "\""); throw; }
             Schtasks("/delete /f /tn \"" + TaskName + "\"");
-            System.IO.File.Delete(Flag);
-            Send(BatteryCharge);
+            if (System.IO.File.Exists(Flag)) System.IO.File.Delete(Flag);
+        }
+    }
+
+    // State shown on the System page. Read once: ConsentPromptBehaviorAdmin 0 means "elevate without prompting", EnableLUA 0 means UAC is off.
+    static class Uac
+    {
+        public static bool Prompts = Read();
+
+        public static bool PromptsFrom(object enableLua, object consent)
+        {
+            return !Equals(enableLua, 0) && !Equals(consent, 0);
+        }
+
+        static bool Read()
+        {
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"))
+                    return k == null || PromptsFrom(k.GetValue("EnableLUA"), k.GetValue("ConsentPromptBehaviorAdmin"));
+            }
+            catch { return true; }
         }
     }
 
@@ -1035,11 +1149,14 @@ namespace SnapControl
             int ok = 0;
             bool reboot = false;
             string sys = Environment.GetFolderPath(Environment.SpecialFolder.System), pnp = System.IO.Path.Combine(sys, "pnputil.exe");
+            ChargeLimit.SecureDataDir();
             using (var wc = Client())
                 foreach (string raw in ids)
                 {
                     string id = raw.Substring(4);
-                    string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "snapcontrol_cat_" + id);
+                    // the list comes from a file in the user's temp folder, and the id becomes a path that gets deleted
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(id, "^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) { sb.AppendLine(L.T("ERROR   invalid catalog id", "ERRORE  id catalogo non valido")); continue; }
+                    string dir = System.IO.Path.Combine(ChargeLimit.DataDir, "work", Guid.NewGuid().ToString("N"));
                     try
                     {
                         Ua(wc);
@@ -1179,8 +1296,51 @@ namespace SnapControl
             if (!hash.Equals(sha256, StringComparison.OrdinalIgnoreCase)) return L.T("SHA-256 does not match", "SHA-256 non corrispondente");
             if (!Native.SignatureValid(path)) return L.T("invalid signature", "firma non valida");
             using (var cert = new System.Security.Cryptography.X509Certificates.X509Certificate2(System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(path)))
-                if (cert.Subject.IndexOf("O=Lenovo", StringComparison.OrdinalIgnoreCase) < 0) return L.T("not signed by Lenovo", "non firmato da Lenovo");
+            {
+                if (!System.Text.RegularExpressions.Regex.IsMatch(cert.Subject, "(^|, )O=Lenovo(,|$)")) return L.T("not signed by Lenovo", "non firmato da Lenovo");
+                // machine stores only: a root added to the user's own store must not count
+                using (var chain = new System.Security.Cryptography.X509Certificates.X509Chain(true))
+                {
+                    chain.ChainPolicy.RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
+                    chain.ChainPolicy.VerificationFlags = System.Security.Cryptography.X509Certificates.X509VerificationFlags.IgnoreNotTimeValid;
+                    if (!chain.Build(cert)) return L.T("signature does not reach a trusted root of this PC", "la firma non arriva a un'autorità attendibile di questo PC");
+                }
+            }
             return null;
+        }
+
+        // Copy into a folder only administrators can write to, then check that copy: nothing can swap it or sit next to it.
+        public static string PrepareBios(string source, string sha256)
+        {
+            if (!System.Text.RegularExpressions.Regex.IsMatch(sha256, "^[0-9a-fA-F]{64}$") || !System.Text.RegularExpressions.Regex.IsMatch(System.IO.Path.GetFileName(source), "^[a-zA-Z0-9]{1,16}\\.exe$"))
+                throw new Exception(L.T("invalid package", "pacchetto non valido"));
+            ChargeLimit.SecureDataDir();
+            string root = System.IO.Path.Combine(ChargeLimit.DataDir, "bios-run");
+            if (System.IO.Directory.Exists(root)) System.IO.Directory.Delete(root, true);   // left by an installer that restarted the PC
+            string dir = System.IO.Path.Combine(root, Guid.NewGuid().ToString("N")), copy = System.IO.Path.Combine(dir, System.IO.Path.GetFileName(source));
+            System.IO.Directory.CreateDirectory(dir);
+            System.IO.File.Copy(source, copy);
+            string err = VerifyBios(copy, sha256);
+            if (err != null) { System.IO.Directory.Delete(root, true); throw new Exception(err); }
+            return copy;
+        }
+
+        // Elevated. Nothing from the caller is trusted but the file path: version and hash come from Lenovo, here.
+        public static int RunBios(string source)
+        {
+            Search();
+            if (LatestBios == null || !LatestBios.BiosFlash || LatestBios.BiosSha256 == null) throw new Exception(L.T("no newer BIOS from Lenovo", "nessun BIOS più nuovo da Lenovo"));
+            var b = BatteryInfo.Read();
+            if (!b.OnAc || b.Percent < 30) throw new Exception(L.T("charger and at least 30% battery are required", "servono alimentatore e almeno il 30% di batteria"));
+            string copy = PrepareBios(source, LatestBios.BiosSha256), dir = System.IO.Path.GetDirectoryName(copy);
+            var psi = new System.Diagnostics.ProcessStartInfo(copy) { UseShellExecute = false, WorkingDirectory = dir };
+            // the installer unpacks into its temp folder: the user's one could be changed while it runs
+            psi.EnvironmentVariables["TEMP"] = dir;
+            psi.EnvironmentVariables["TMP"] = dir;
+            int code;
+            using (var p = System.Diagnostics.Process.Start(psi)) { p.WaitForExit(); code = p.ExitCode; }
+            try { System.IO.Directory.Delete(dir, true); } catch { }
+            return code;
         }
 
         // Downloads the package if it is missing or not valid; returns the error, null if the file is ready.
@@ -1722,7 +1882,7 @@ namespace SnapControl
         {
             Func<string> text, why = null;
             string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SnapControl");
-            string file = System.IO.Path.Combine(dir, "app-usage.csv");
+            string file = System.IO.Path.Combine(dir, Guid.NewGuid().ToString("N") + ".csv");
             List<string[]> rows = null;
             try
             {
@@ -1822,10 +1982,20 @@ namespace SnapControl
         // The old file is deleted first: if powercfg fails it must not pass for a successful export.
         static int Export(string file)
         {
-            System.IO.File.Delete(file);
-            var psi = new System.Diagnostics.ProcessStartInfo(System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe"), "/srumutil /output \"" + file + "\" /csv") { UseShellExecute = false, CreateNoWindow = true };
-            using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
-            return System.IO.File.Exists(file) ? 0 : 1;
+            // the target is in a folder the user controls: this elevated process only ever creates a new file there
+            ChargeLimit.SecureDataDir();
+            string work = System.IO.Path.Combine(ChargeLimit.DataDir, "work");
+            System.IO.Directory.CreateDirectory(work);
+            string tmp = System.IO.Path.Combine(work, Guid.NewGuid().ToString("N") + ".csv");
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe"), "/srumutil /output \"" + tmp + "\" /csv") { UseShellExecute = false, CreateNoWindow = true };
+                using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
+                if (!System.IO.File.Exists(tmp)) return 1;
+                System.IO.File.Copy(tmp, file, false);
+                return 0;
+            }
+            finally { if (System.IO.File.Exists(tmp)) System.IO.File.Delete(tmp); }
         }
     }
 
@@ -1853,7 +2023,7 @@ namespace SnapControl
         List<UpdateItem> updates;                              // null = search not done yet
         readonly HashSet<string> selected = new HashSet<string>();
         readonly HashSet<string> flagged = new HashSet<string>(Settings.Flagged);
-        bool biosBusy;
+        bool biosBusy, chargeBusy;
         UpdateItem biosLatest;                                 // null = not asked yet
         SocSample soc;
         List<string[]> qcRows;
@@ -2167,8 +2337,11 @@ namespace SnapControl
         void InstallUpdates(List<string> ids)
         {
             if (installing || ids.Count == 0) return;
+            // the Windows prompt is not always there: without it this would be the only confirmation
+            if (MessageBox.Show(this, L.T("Install " + ids.Count + " driver update(s)?", "Installare " + ids.Count + " aggiornamenti driver?"),
+                    "SnapControl", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             installing = true;
-            drvStatus = () => L.T("Installing " + ids.Count + (ids.Count == 1 ? " driver" : " drivers") + " (confirm the Windows prompt)…", "Installazione di " + ids.Count + " driver in corso (conferma la richiesta di Windows)…");
+            drvStatus = () => L.T("Installing " + ids.Count + (ids.Count == 1 ? " driver" : " drivers") + "…", "Installazione di " + ids.Count + " driver in corso…");
             Invalidate();
             Background(delegate
             {
@@ -2176,8 +2349,7 @@ namespace SnapControl
                 string job = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "snapcontrol_" + Guid.NewGuid().ToString("N"));
                 try
                 {
-                    System.IO.File.WriteAllLines(job + ".in", ids);
-                    var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--wu-install \"" + job + "\"") { Verb = "runas", UseShellExecute = true };
+                    var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--wu-install \"" + job + "\" " + string.Join(" ", ids)) { Verb = "runas", UseShellExecute = true };
                     using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
                     msg = System.IO.File.Exists(job + ".out") ? System.IO.File.ReadAllText(job + ".out") : L.T("Installation interrupted.", "Installazione interrotta.");
                 }
@@ -2185,7 +2357,7 @@ namespace SnapControl
                 catch (Exception ex) { msg = L.T("Installation failed: ", "Installazione non riuscita: ") + ex.Message; }
                 finally
                 {
-                    try { System.IO.File.Delete(job + ".in"); System.IO.File.Delete(job + ".out"); } catch { }
+                    try { System.IO.File.Delete(job + ".out"); } catch { }
                 }
                 BeginInvoke((MethodInvoker)delegate
                 {
@@ -2250,6 +2422,11 @@ namespace SnapControl
         void StartBiosInstaller(UpdateItem u, string path)
         {
             if (!u.BiosFlash) return;
+            if (MessageBox.Show(this, L.T(
+                    "Start the Lenovo installer for " + u.Title + "?\n\n• Do not turn off or restart the PC during the update: it can damage the laptop.\n• BIOS settings return to their defaults.\n• Lenovo says not to go back to an earlier BIOS.\n• The PC restarts by itself: save your work.\n• If BitLocker or device encryption is on, have the recovery key at hand.",
+                    "Avviare l'installer Lenovo per " + u.Title + "?\n\n• Non spegnere né riavviare il PC durante l'aggiornamento: può danneggiare il laptop.\n• Le impostazioni del BIOS tornano ai valori predefiniti.\n• Lenovo dice di non tornare a un BIOS precedente.\n• Il PC si riavvia da solo: salva il lavoro.\n• Se BitLocker o la crittografia del dispositivo sono attivi, tieni pronta la chiave di ripristino."),
+                    "SnapControl · BIOS", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            // after the question: the cable can be pulled while it is open
             var b = BatteryInfo.Read();
             // shortcut: 30% is our margin, the Lenovo readme gives no threshold; raise it if Lenovo publishes one
             if (!b.OnAc || b.Percent < 30)
@@ -2258,16 +2435,10 @@ namespace SnapControl
                 drvStatus = () => L.T("BIOS update not started: charger or battery level.", "Aggiornamento BIOS non avviato: alimentatore o livello batteria.");
                 return;
             }
-            if (MessageBox.Show(this, L.T(
-                    "Start the Lenovo installer for " + u.Title + "?\n\n• Do not turn off or restart the PC during the update: it can damage the laptop.\n• BIOS settings return to their defaults.\n• Lenovo says not to go back to an earlier BIOS.\n• The PC restarts by itself: save your work.\n• If BitLocker or device encryption is on, have the recovery key at hand.",
-                    "Avviare l'installer Lenovo per " + u.Title + "?\n\n• Non spegnere né riavviare il PC durante l'aggiornamento: può danneggiare il laptop.\n• Le impostazioni del BIOS tornano ai valori predefiniti.\n• Lenovo dice di non tornare a un BIOS precedente.\n• Il PC si riavvia da solo: salva il lavoro.\n• Se BitLocker o la crittografia del dispositivo sono attivi, tieni pronta la chiave di ripristino."),
-                    "SnapControl · BIOS", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
-            string err = Lenovo.VerifyBios(path, u.BiosSha256);
-            if (err != null) { drvStatus = () => L.T("BIOS package refused: ", "Pacchetto BIOS rifiutato: ") + err; return; }
             try
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { Verb = "runas", UseShellExecute = true }).Dispose();
-                drvStatus = () => L.T("Lenovo installer started: follow its window.", "Installer Lenovo avviato: segui la sua finestra.");
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--bios-run \"" + path + "\"") { Verb = "runas", UseShellExecute = true }).Dispose();
+                drvStatus = () => L.T("Lenovo installer requested: follow its window.", "Installer Lenovo richiesto: segui la sua finestra.");
             }
             catch (System.ComponentModel.Win32Exception) { drvStatus = () => L.T("BIOS update cancelled: administrator permission not granted.", "Aggiornamento BIOS annullato: permesso di amministratore non concesso."); }
         }
@@ -2428,18 +2599,21 @@ namespace SnapControl
             RefreshControls();
         }
 
-        void SetChargeLimit(bool on)
+        // level 0 = off
+        void SetChargeLimit(int level)
         {
-            if (on == ChargeLimit.Enabled) return;
+            // off stays clickable when already off: it is the way to free a charge left stopped
+            if (chargeBusy || (level != 0 && ChargeLimit.Enabled && level == ChargeLimit.Stop)) return;
+            chargeBusy = true;
             Background(delegate
             {
                 try
                 {
-                    var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--charge-limit " + (on ? "on" : "off")) { Verb = "runas", UseShellExecute = true };
+                    var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--charge-limit " + (level == 0 ? "off" : level.ToString())) { Verb = "runas", UseShellExecute = true };
                     using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
                 }
                 catch (System.ComponentModel.Win32Exception) { }   // administrator permission not granted
-                BeginInvoke((MethodInvoker)Invalidate);
+                BeginInvoke((MethodInvoker)delegate { chargeBusy = false; Invalidate(); });
             });
         }
 
@@ -2645,6 +2819,7 @@ namespace SnapControl
             {
                 int ry = Rows(g, cx, cy, cw, sysRows);
                 PillButton(g, cx, ry + Px(16), L.T("AUTHOR: MICH-DE · GITHUB ↗", "AUTORE: MICH-DE · GITHUB ↗"), false, delegate { Open("https://github.com/mich-de/snapcontrol"); });
+                PaintUac(g, cx, ry + Px(62), cw);
             }
             else if (page == 1) PaintBattery(g, cx, cy, cw);
             else if (page == 2) PaintDrivers(g, cx, cy, cw, h - pad);
@@ -2696,10 +2871,18 @@ namespace SnapControl
             Txt(g, L.T("CHARGE LIMIT", "LIMITE DI CARICA"), fMonoSmall, T.Muted, new Rectangle(x, y, w, Px(16)));
             y += Px(22);
             bool limit = ChargeLimit.Enabled;
-            bx = PillButton(g, x, y, L.T("OFF", "NO"), !limit, delegate { SetChargeLimit(false); }).Right + Px(8);
-            bx = PillButton(g, bx, y, ChargeLimit.Stop + "%", limit, delegate { SetChargeLimit(true); }).Right + Px(16);
-            Txt(g, L.T("Stops at " + ChargeLimit.Stop + "%, resumes at " + ChargeLimit.Resume + "%. Does not discharge when plugged in.", "Si ferma all'" + ChargeLimit.Stop + "%, riprende al " + ChargeLimit.Resume + "%. Non scarica con l'alimentatore collegato."), fMono, T.Muted, new Rectangle(bx, y, Math.Max(0, x + w - bx), Px(34)));
-            y += Px(50);
+            int stop = limit ? ChargeLimit.Stop : 0;
+            bx = PillButton(g, x, y, L.T("OFF", "NO"), !limit, delegate { SetChargeLimit(0); }).Right + Px(8);
+            foreach (int lv in ChargeLimit.Levels)
+            {
+                int level = lv;
+                bx = PillButton(g, bx, y, level + "%", level == stop, delegate { SetChargeLimit(level); }).Right + Px(8);
+            }
+            y += Px(40);
+            Txt(g, limit
+                ? L.T("Stops at " + stop + "%, resumes at " + (stop - ChargeLimit.Margin) + "%. Does not discharge when plugged in.", "Si ferma al " + stop + "%, riprende al " + (stop - ChargeLimit.Margin) + "%. Non scarica con l'alimentatore collegato.")
+                : L.T("Choose where charging stops: it resumes " + ChargeLimit.Margin + "% below. Does not discharge when plugged in.", "Scegli dove fermare la carica: riprende " + ChargeLimit.Margin + "% sotto. Non scarica con l'alimentatore collegato."), fMono, T.Muted, new Rectangle(x, y, w, Px(20)));
+            y += Px(34);
 
             y = Rows(g, x, y, w, bat.Rows(autonomy.Text(bat))) + Px(18);
 
@@ -2892,6 +3075,13 @@ namespace SnapControl
             Settings.Flagged = new List<string>(flagged).ToArray();
         }
 
+        void PaintUac(Graphics g, int x, int y, int w)
+        {
+            Txt(g, Uac.Prompts
+                ? L.T("UAC · on: Windows asks at each admin action", "UAC · attivo: Windows chiede a ogni azione da amministratore")
+                : L.T("UAC · no prompts on this PC: any program can get admin rights without asking", "UAC · nessuna richiesta su questo PC: qualsiasi programma può avere i diritti di amministratore senza chiedere"), fMono, Uac.Prompts ? T.Muted : T.Accent, new Rectangle(x, y, w, Px(34)));
+        }
+
         void PaintDrivers(Graphics g, int x, int y, int w, int bottom)
         {
             if (drivers == null) LoadDrivers();
@@ -3053,7 +3243,7 @@ namespace SnapControl
                 System.IO.File.WriteAllText(args[1], f.Report(), Encoding.UTF8);
                 return;
             }
-            if (args.Length == 2 && args[0] == "--wu-install")
+            if (args.Length >= 3 && args[0] == "--wu-install")
             {
                 // Elevated process started by the window: installs the selected updates and writes the outcome.
                 L.It = Settings.Italian;
@@ -3062,7 +3252,12 @@ namespace SnapControl
                 {
                     var wu = new HashSet<string>();
                     var cat = new List<string>();
-                    foreach (string id in System.IO.File.ReadAllLines(args[1] + ".in")) if (id.StartsWith("cat:")) cat.Add(id); else wu.Add(id);
+                    for (int i = 2; i < args.Length; i++)
+                    {
+                        string id = args[i];
+                        if (!System.Text.RegularExpressions.Regex.IsMatch(id, "^(cat:)?[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) throw new Exception("id: " + id);
+                        if (id.StartsWith("cat:")) cat.Add(id); else wu.Add(id);
+                    }
                     var parts = new List<string>();
                     if (wu.Count > 0) parts.Add(Drivers.InstallWindowsUpdate(wu));
                     if (cat.Count > 0) parts.Add(MsCatalog.Install(cat));
@@ -3070,14 +3265,29 @@ namespace SnapControl
                     result = string.Join(" · ", parts.ConvertAll(p => p.Split('\n')[0])) + "\n" + string.Join("\n", parts.ConvertAll(p => p.Substring(p.IndexOf('\n') + 1)));
                 }
                 catch (Exception ex) { result = L.T("Installation failed: ", "Installazione non riuscita: ") + ex.Message; }
-                System.IO.File.WriteAllText(args[1] + ".out", result, Encoding.UTF8);
+                // CreateNew: a link prepared at this path must not redirect an elevated write
+                using (var o = new System.IO.StreamWriter(new System.IO.FileStream(args[1] + ".out", System.IO.FileMode.CreateNew), Encoding.UTF8)) o.Write(result);
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--bios-run")
+            {
+                // Elevated process started by the window: the package is checked again in a folder only administrators can write to.
+                L.It = Settings.Italian;
+                try { Environment.ExitCode = Lenovo.RunBios(args[1]); }
+                catch (Exception ex) { Environment.ExitCode = 1; MessageBox.Show(L.T("BIOS package refused: ", "Pacchetto BIOS rifiutato: ") + ex.Message, "SnapControl"); }
                 return;
             }
             if (args.Length == 2 && args[0] == "--charge-limit")
             {
                 if (args[1] == "run") { ChargeLimit.Run(); return; }
                 // Elevated process started by the window or the uninstaller.
-                try { if (args[1] == "on") ChargeLimit.Enable(); else ChargeLimit.Disable(); }
+                int level;
+                try
+                {
+                    if (args[1] == "off") ChargeLimit.Disable();
+                    else if (int.TryParse(args[1], out level)) ChargeLimit.Enable(level);
+                    else throw new Exception("argomento non valido: " + args[1]);
+                }
                 catch (Exception ex) { Environment.ExitCode = 1; MessageBox.Show("Limite di carica: " + ex.Message, "SnapControl"); }
                 return;
             }
