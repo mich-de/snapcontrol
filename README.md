@@ -36,6 +36,26 @@ Author: **mich-de** — [github.com/mich-de/snapcontrol](https://github.com/mich
 - **UAC** — the System page shows whether Windows asks for permission on this PC. Admin actions always go through the Windows prompt; there is no way around it for one app that does not create a privilege escalation path, so SnapControl offers none. Driver installs also ask for SnapControl's own confirmation.
 - **Two languages** — the window is in English (default) or Italian, switched with the `EN`/`IT` button in the top bar. The command-line output and the charge-limit log are in Italian only.
 
+## Requirements
+
+**Nothing has to be changed in Windows and no library has to be installed for normal use.** No .NET download, Visual C++ runtime, kernel driver, test signing, Developer Mode or Secure Boot change.
+
+- **PC**: Lenovo IdeaPad Slim 5 14Q8X9 (83HL) is the only model tested. On other PCs the Lenovo, BIOS and charge-limit functions may not work.
+- **Windows**: Windows 11 ARM64, tested on build 26300. Native ARM64 needs 24H2 or later; on earlier versions the manifest setting is ignored and the app starts under x64 emulation (not tested).
+- **Runtime**: .NET Framework 4.8.1, already included in Windows 11 22H2 and later.
+- **Installer warning**: the installer is not code-signed, so SmartScreen may warn on a downloaded copy. Check its SHA-256 against the release page, then choose *More info › Run anyway*.
+
+Some functions need more:
+
+| Function | Needs |
+|---|---|
+| Charge limit | Administrator rights; SnapControl installed in Program Files; Qualcomm battery driver (tested: `qcbattminiclass8380` 1.0.4458.2600); charger connected. |
+| Driver search and install | Internet; Windows Update service (`wuauserv`) not disabled; administrator rights to install. |
+| BIOS | Internet; administrator rights; charger and at least 30% battery. If BitLocker or device encryption is on, keep the recovery key and suspend protection first: SnapControl does not do this. |
+| `APP USAGE` | Administrator rights; `DPS` service running and autologger `DiagLog` enabled (`Start` = 1 in `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\DiagLog`). These are on by default, but privacy or debloat tools may turn them off: without them `powercfg /srumutil` has no data. Windows also needs time on battery to collect it. |
+
+**UAC** does not need changing: SnapControl uses the normal Windows prompt. A standard account will be asked for an administrator password. If `ConsentPromptBehaviorAdmin` is `0`, any program can get admin rights without asking; the recommended value is `5`.
+
 ## Principles
 
 - **Native ARM64** — runs on the .NET Framework 4.8.1 ARM64 runtime included in Windows 11 (the manifest declares `supportedArchitectures`; without it Windows would start the app under x64 emulation).
@@ -60,7 +80,7 @@ This produces `bin\SnapControl.exe` (with `SnapControl.exe.config` next to it) a
 
 ## Install
 
-`SnapControl-Setup.exe` asks for administrator permission, installs to `C:\Program Files\SnapControl`, creates shortcuts on the desktop and in the Start menu, and appears in *Settings › Installed apps*, where it can be uninstalled (this also removes the automatic start and the charge-limit task, and lets charging resume). Running it again updates the existing installation, closing the app first if it is open. Options: `/quiet` (no windows), `uninstall.exe /uninstall`.
+Download `SnapControl-Setup.exe` from [Releases](https://github.com/mich-de/snapcontrol/releases/latest). It asks for administrator permission, installs to `C:\Program Files\SnapControl`, creates shortcuts on the desktop and in the Start menu, and appears in *Settings › Installed apps*, where it can be uninstalled (this also removes the automatic start and the charge-limit task, and lets charging resume). Running it again updates the existing installation, closing the app first if it is open. Options: `/quiet` (no windows), `uninstall.exe /uninstall`.
 
 The icon (`src\app.ico`) is regenerated with `tools\MakeIcon.cs`.
 
