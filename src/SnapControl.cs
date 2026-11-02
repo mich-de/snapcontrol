@@ -22,6 +22,48 @@ namespace SnapControl
 {
     static class Native
     {
+        [StructLayout(LayoutKind.Sequential)]
+        struct WinTrustFileInfo
+        {
+            public uint Size;
+            [MarshalAs(UnmanagedType.LPWStr)] public string Path;
+            public IntPtr File, Subject;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct WinTrustData
+        {
+            public uint Size;
+            public IntPtr PolicyData, SipData;
+            public uint UiChoice, Revocation, UnionChoice;
+            public IntPtr FileInfo;
+            public uint StateAction;
+            public IntPtr StateData, UrlReference;
+            public uint ProvFlags, UiContext;
+            public IntPtr SignatureSettings;
+        }
+
+        [DllImport("wintrust.dll")]
+        static extern int WinVerifyTrust(IntPtr hwnd, ref Guid action, ref WinTrustData data);
+
+        // Authenticode check without UI: the signature matches the file and chains to a trusted root.
+        public static bool SignatureValid(string path)
+        {
+            var action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");   // WINTRUST_ACTION_GENERIC_VERIFY_V2
+            IntPtr file = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WinTrustFileInfo)));
+            try
+            {
+                Marshal.StructureToPtr(new WinTrustFileInfo { Size = (uint)Marshal.SizeOf(typeof(WinTrustFileInfo)), Path = path }, file, false);
+                var data = new WinTrustData { Size = (uint)Marshal.SizeOf(typeof(WinTrustData)), UiChoice = 2, UnionChoice = 1, FileInfo = file };
+                return WinVerifyTrust(IntPtr.Zero, ref action, ref data) == 0;
+            }
+            finally
+            {
+                Marshal.DestroyStructure(file, typeof(WinTrustFileInfo));
+                Marshal.FreeHGlobal(file);
+            }
+        }
+
         [DllImport("powrprof.dll")]
         public static extern uint PowerGetEffectiveOverlayScheme(out Guid scheme);
         // The GUID must be passed by reference: by value it works on x64 only by accident (structs >8 bytes
@@ -763,6 +805,8 @@ namespace SnapControl
     {
         public string Id, Title, Provider, Date, Source, Url;
         public string Inst, By;                                // installed version and vendor, if known
+        public string BiosUrl, BiosSha256;                     // package SnapControl may download
+        public bool BiosFlash;                                 // newer than the installed BIOS: the installer may start
         public bool Installable { get { return Source == "WINDOWS UPDATE" || Source == MsCatalog.Source; } }
 
         // Source stays the value compared in Installable: here only the on-screen text.
@@ -1095,6 +1139,68 @@ namespace SnapControl
             return string.Compare(avail, installed, StringComparison.OrdinalIgnoreCase) > 0;
         }
 
+        // Stricter than BiosNewer, which also shows versions it cannot compare: an installer is offered only for
+        // the same prefix and a higher version, because Lenovo says not to flash back to an earlier BIOS.
+        public static bool BiosFlashable(string avail, string installed)
+        {
+            return avail.Length == installed.Length && avail.Length >= 4
+                && string.Compare(avail, 0, installed, 0, 4, StringComparison.OrdinalIgnoreCase) == 0
+                && string.Compare(avail, installed, StringComparison.OrdinalIgnoreCase) > 0;
+        }
+
+        // Only the EXE named after this version, from Lenovo's download host and with its hash, is accepted.
+        static void SetBiosFile(UpdateItem it, object[] files, string ver)
+        {
+            if (files == null) return;
+            foreach (object f in files)
+            {
+                string url = Convert.ToString(J(f, "URL")) ?? "", sha = Convert.ToString(J(f, "SHA256")) ?? "";
+                if (Convert.ToString(J(f, "TypeString")) != "EXE" || !System.Text.RegularExpressions.Regex.IsMatch(sha, "^[0-9a-fA-F]{64}$")) continue;
+                if (!url.StartsWith("https://download.lenovo.com/", StringComparison.OrdinalIgnoreCase)
+                    || !url.EndsWith("/" + ver + ".exe", StringComparison.OrdinalIgnoreCase)) continue;
+                it.BiosUrl = url;
+                it.BiosSha256 = sha;
+                return;
+            }
+        }
+
+        public static string BiosPath(UpdateItem u)
+        {
+            return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SnapControl\bios", u.BiosUrl.Substring(u.BiosUrl.LastIndexOf('/') + 1));
+        }
+
+        // Returns the reason for refusing the file, null if it is the expected Lenovo package.
+        public static string VerifyBios(string path, string sha256)
+        {
+            string hash;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var f = System.IO.File.OpenRead(path))
+                hash = BitConverter.ToString(sha.ComputeHash(f)).Replace("-", "");
+            if (!hash.Equals(sha256, StringComparison.OrdinalIgnoreCase)) return L.T("SHA-256 does not match", "SHA-256 non corrispondente");
+            if (!Native.SignatureValid(path)) return L.T("invalid signature", "firma non valida");
+            using (var cert = new System.Security.Cryptography.X509Certificates.X509Certificate2(System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(path)))
+                if (cert.Subject.IndexOf("O=Lenovo", StringComparison.OrdinalIgnoreCase) < 0) return L.T("not signed by Lenovo", "non firmato da Lenovo");
+            return null;
+        }
+
+        // Downloads the package if it is missing or not valid; returns the error, null if the file is ready.
+        public static string EnsureBios(UpdateItem u)
+        {
+            string path = BiosPath(u), part = path + ".part";
+            if (System.IO.File.Exists(path) && VerifyBios(path, u.BiosSha256) == null) return null;
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
+            System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12 | (System.Net.SecurityProtocolType)12288;
+            using (var wc = new System.Net.WebClient())
+            {
+                wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "Mozilla/5.0";
+                wc.DownloadFile(u.BiosUrl, part);
+            }
+            string err = VerifyBios(part, u.BiosSha256);
+            if (err == null) { System.IO.File.Delete(path); System.IO.File.Move(part, path); }
+            else System.IO.File.Delete(part);
+            return err;
+        }
+
         // Walks the Dictionary/arrays returned by JavaScriptSerializer.
         static object J(object o, params string[] path)
         {
@@ -1105,6 +1211,8 @@ namespace SnapControl
             }
             return o;
         }
+
+        public static UpdateItem LatestBios;   // what Lenovo publishes now, even when it is not newer than the installed BIOS
 
         public static List<UpdateItem> Search()
         {
@@ -1132,6 +1240,11 @@ namespace SnapControl
                     if (Array.IndexOf(SkipCategories, cat) >= 0) continue;
                     string ver = (Convert.ToString(J(i, "SummaryInfo", "Version")) ?? "").Trim();
                     bool isBios = cat == "BIOS/UEFI";
+                    if (isBios)
+                    {
+                        LatestBios = new UpdateItem { Id = Convert.ToString(J(i, "DocId")), Title = "BIOS " + ver, Source = "LENOVO", Provider = "Lenovo", Inst = bios, Date = "", By = ver, BiosFlash = BiosFlashable(ver, bios) };
+                        SetBiosFile(LatestBios, J(i, "Files") as object[], ver);
+                    }
                     if (isBios && !BiosNewer(ver, bios)) continue;
                     string doc = Convert.ToString(J(i, "DocId"));
                     var it = new UpdateItem
@@ -1740,6 +1853,8 @@ namespace SnapControl
         List<UpdateItem> updates;                              // null = search not done yet
         readonly HashSet<string> selected = new HashSet<string>();
         readonly HashSet<string> flagged = new HashSet<string>(Settings.Flagged);
+        bool biosBusy;
+        UpdateItem biosLatest;                                 // null = not asked yet
         SocSample soc;
         List<string[]> qcRows;
         bool socBusy;
@@ -2038,6 +2153,7 @@ namespace SnapControl
                 {
                     wuBusy = false;
                     updates = res;
+                    biosLatest = Lenovo.LatestBios;
                     selected.Clear();
                     // catalog drivers (from other OEMs) are not preselected
                     foreach (var u in res) if (u.Source == "WINDOWS UPDATE" && !flagged.Contains(u.Id)) selected.Add(u.Id);
@@ -2082,6 +2198,78 @@ namespace SnapControl
                     if (msg.Contains("\n")) MessageBox.Show(this, msg, L.T("SnapControl · drivers", "SnapControl · driver"));
                 });
             });
+        }
+
+        void CheckBios()
+        {
+            if (biosBusy) return;
+            biosBusy = true;
+            drvStatus = () => L.T("Asking Lenovo for the latest BIOS…", "Richiesta a Lenovo dell'ultimo BIOS…");
+            Invalidate();
+            Background(delegate
+            {
+                string err = null;
+                try { Lenovo.Search(); }
+                catch (Exception ex) { err = ex.Message.Trim(); }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    biosBusy = false;
+                    biosLatest = Lenovo.LatestBios;
+                    if (err != null) drvStatus = () => L.T("Lenovo unreachable (", "Lenovo non raggiungibile (") + err + ")";
+                    else if (biosLatest == null) drvStatus = () => L.T("Lenovo lists no BIOS for this model.", "Lenovo non elenca un BIOS per questo modello.");
+                    else drvStatus = () => L.T("Lenovo latest BIOS: ", "Ultimo BIOS Lenovo: ") + biosLatest.By;
+                    Invalidate();
+                });
+            });
+        }
+
+        // Installer offered by Lenovo, shown to the user: no silent flash, and the file is checked again right before it starts.
+        void BiosAction(UpdateItem u, bool install)
+        {
+            if (biosBusy) return;
+            biosBusy = true;
+            drvStatus = () => L.T("Downloading and checking the BIOS package…", "Download e verifica del pacchetto BIOS…");
+            Invalidate();
+            Background(delegate
+            {
+                string err;
+                try { err = Lenovo.EnsureBios(u); }
+                catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    biosBusy = false;
+                    string path = Lenovo.BiosPath(u);
+                    if (err != null) drvStatus = () => L.T("BIOS package refused: ", "Pacchetto BIOS rifiutato: ") + err;
+                    else if (install) StartBiosInstaller(u, path);
+                    else drvStatus = () => L.T("BIOS package checked and saved: ", "Pacchetto BIOS verificato e salvato: ") + path;
+                    Invalidate();
+                });
+            });
+        }
+
+        void StartBiosInstaller(UpdateItem u, string path)
+        {
+            if (!u.BiosFlash) return;
+            var b = BatteryInfo.Read();
+            // shortcut: 30% is our margin, the Lenovo readme gives no threshold; raise it if Lenovo publishes one
+            if (!b.OnAc || b.Percent < 30)
+            {
+                MessageBox.Show(this, L.T("Connect the charger and charge the battery to at least 30% before updating the BIOS.", "Collega l'alimentatore e carica la batteria almeno al 30% prima di aggiornare il BIOS."), "SnapControl · BIOS", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                drvStatus = () => L.T("BIOS update not started: charger or battery level.", "Aggiornamento BIOS non avviato: alimentatore o livello batteria.");
+                return;
+            }
+            if (MessageBox.Show(this, L.T(
+                    "Start the Lenovo installer for " + u.Title + "?\n\n• Do not turn off or restart the PC during the update: it can damage the laptop.\n• BIOS settings return to their defaults.\n• Lenovo says not to go back to an earlier BIOS.\n• The PC restarts by itself: save your work.\n• If BitLocker or device encryption is on, have the recovery key at hand.",
+                    "Avviare l'installer Lenovo per " + u.Title + "?\n\n• Non spegnere né riavviare il PC durante l'aggiornamento: può danneggiare il laptop.\n• Le impostazioni del BIOS tornano ai valori predefiniti.\n• Lenovo dice di non tornare a un BIOS precedente.\n• Il PC si riavvia da solo: salva il lavoro.\n• Se BitLocker o la crittografia del dispositivo sono attivi, tieni pronta la chiave di ripristino."),
+                    "SnapControl · BIOS", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            string err = Lenovo.VerifyBios(path, u.BiosSha256);
+            if (err != null) { drvStatus = () => L.T("BIOS package refused: ", "Pacchetto BIOS rifiutato: ") + err; return; }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { Verb = "runas", UseShellExecute = true }).Dispose();
+                drvStatus = () => L.T("Lenovo installer started: follow its window.", "Installer Lenovo avviato: segui la sua finestra.");
+            }
+            catch (System.ComponentModel.Win32Exception) { drvStatus = () => L.T("BIOS update cancelled: administrator permission not granted.", "Aggiornamento BIOS annullato: permesso di amministratore non concesso."); }
         }
 
         static void Open(string url)
@@ -2729,6 +2917,23 @@ namespace SnapControl
             using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, x, y, w, bottom - y);
             Txt(g, drvStatus(), fMono, T.Muted, new Rectangle(x, y, w, Px(20)));
             y += Px(32);
+
+            // BIOS row, always visible
+            {
+                var inst = drivers.Find(d => d.Device == "BIOS");
+                int bh = Px(46), ax = x + w, ay = y + (bh - Px(34)) / 2;
+                var b = biosLatest;
+                Action<string, Action> act = (label, a) => { ax -= TxtW(label, fMono) + Px(20); PillButton(g, ax, ay, label, false, biosBusy ? null : a, 20); ax -= Px(6); };
+                act(biosBusy ? L.T("WORKING…", "ATTENDI…") : L.T("CHECK BIOS", "CONTROLLA BIOS"), CheckBios);
+                if (b != null && b.BiosUrl != null) act(L.T("DOWNLOAD", "SCARICA"), delegate { BiosAction(b, false); });
+                if (b != null && b.BiosUrl != null && b.BiosFlash) act(L.T("INSTALL", "INSTALLA"), delegate { BiosAction(b, true); });
+                string text = "BIOS · " + L.T("installed ", "installato ") + (inst == null ? "?" : inst.Version);
+                if (b != null) text += b.BiosFlash ? " · " + L.T("NEW ", "NUOVO ") + b.By : " · " + L.T("Lenovo latest ", "ultimo Lenovo ") + b.By + (inst != null && inst.Version.Equals(b.By, StringComparison.OrdinalIgnoreCase) ? L.T(": up to date", ": aggiornato") : "");
+                Txt(g, text, fMono, b != null && b.BiosFlash ? T.Accent : T.Text, new Rectangle(x, y, ax - x - Px(6), bh));
+                y += bh;
+                HLine(g, x, x + w, y, T.Line);
+                y += Px(14);
+            }
 
             // updates found: checkbox for single install, or all together
             if (updates != null && updates.Count > 0)
