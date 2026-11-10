@@ -1424,8 +1424,79 @@ namespace SnapControl
         }
     }
 
+    // ACPI thermal zones in tenths of Kelvin. The WMI class needs administrator rights, so the
+    // elevated --temps process reads it and streams one line every 2 s to the window over a pipe.
+    static class Thermal
+    {
+        // "0C58=3064|0C59=3065|...": hottest zone of each ACPI device; zones reading 0 are unpopulated.
+        public static string Sample()
+        {
+            var max = new SortedDictionary<string, uint>();
+            using (var s = new ManagementObjectSearcher(@"root\WMI", "SELECT InstanceName, CurrentTemperature FROM MSAcpi_ThermalZoneTemperature"))
+            using (var all = s.Get())
+            foreach (ManagementObject o in all)
+                using (o)
+                {
+                    uint t = Convert.ToUInt32(o["CurrentTemperature"]);
+                    if (t == 0) continue;
+                    string k = Key((string)o["InstanceName"]);
+                    uint old;
+                    if (!max.TryGetValue(k, out old) || t > old) max[k] = t;
+                }
+            var parts = new List<string>();
+            foreach (var kv in max) parts.Add(kv.Key + "=" + kv.Value);
+            return string.Join("|", parts);
+        }
+
+        // ACPI\QCOM0C58\0_0 -> 0C58, ACPI\VEN_QCOM&DEV_0CF2&...\0_0 -> 0CF2, ACPI\ThermalZone\TZ39_0 -> TZ39
+        public static string Key(string id)
+        {
+            var p = id.Split('\\');
+            string k = p.Length > 1 ? p[1] : id;
+            int d = k.IndexOf("DEV_");
+            if (d >= 0 && k.Length >= d + 8) return k.Substring(d + 4, 4);
+            if (k.StartsWith("QCOM")) return k.Substring(4);
+            return p.Length > 2 ? p[2].Split('_')[0] : k;
+        }
+
+        // 0 CPU (cluster, core), 1 chassis skin, 2 ADC, 3 other
+        public static int Group(string key)
+        {
+            switch (key)
+            {
+                case "0C58": case "0C59": return 0;
+                case "0C91": case "0CBF": return 1;
+                case "0C5A": case "0C5E": case "0C5F": case "0C60": case "0C61": return 2;
+                default: return 3;
+            }
+        }
+
+        public static void Run(string pipe)
+        {
+            using (var p = new System.IO.Pipes.NamedPipeClientStream(".", pipe, System.IO.Pipes.PipeDirection.Out))
+            {
+                p.Connect(10000);
+                var w = new System.IO.StreamWriter(p, new UTF8Encoding(false)) { AutoFlush = true };
+                // the write fails once the window closes the pipe: that ends this process
+                while (true) { w.WriteLine(Sample()); Thread.Sleep(2000); }
+            }
+        }
+
+        public static List<KeyValuePair<string, double>> Parse(string line)
+        {
+            var r = new List<KeyValuePair<string, double>>();
+            foreach (var e in line.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int i = e.IndexOf('=');
+                uint t;
+                if (i > 0 && uint.TryParse(e.Substring(i + 1), out t)) r.Add(new KeyValuePair<string, double>(e.Substring(0, i), t / 10.0 - 273.15));
+            }
+            return r;
+        }
+    }
+
     // Instantaneous CPU, Adreno GPU and Hexagon NPU load from Windows performance counters (WMI classes
-    // with English names even on Italian Windows). Qualcomm exposes neither temperatures nor GPU/NPU clocks.
+    // with English names even on Italian Windows). Temperatures come from Thermal; GPU/NPU clocks are not exposed.
     sealed class SocSample
     {
         public int Cpu, Perf, MHz, Gpu3d, GpuCompute, GpuVideo, Npu;
@@ -2001,8 +2072,8 @@ namespace SnapControl
 
     sealed class MainForm : Form
     {
-        static string[] Pages { get { return new[] { L.T("SYSTEM", "SISTEMA"), L.T("BATTERY", "BATTERIA"), L.T("DRIVERS", "DRIVER"), "SNAPDRAGON", L.T("CONTROLS", "CONTROLLI") }; } }
-        static string[] Titles { get { return new[] { L.T("System", "Sistema"), L.T("Battery", "Batteria"), L.T("Drivers", "Driver"), "Snapdragon", L.T("Controls", "Controlli") }; } }
+        static string[] Pages { get { return new[] { L.T("SYSTEM", "SISTEMA"), L.T("BATTERY", "BATTERIA"), L.T("DRIVERS", "DRIVER"), "SNAPDRAGON", L.T("CONTROLS", "CONTROLLI"), L.T("THERMAL", "TERMICA") }; } }
+        static string[] Titles { get { return new[] { L.T("System", "Sistema"), L.T("Battery", "Batteria"), L.T("Drivers", "Driver"), "Snapdragon", L.T("Controls", "Controlli"), L.T("Thermal", "Termica") }; } }
 
         int themeIdx = Theme.Load();
         int page = 1;
@@ -2028,6 +2099,9 @@ namespace SnapControl
         SocSample soc;
         List<string[]> qcRows;
         bool socBusy;
+        System.IO.Pipes.NamedPipeServerStream tempPipe;        // open while the elevated --temps process runs
+        List<KeyValuePair<string, double>> temps;              // null = no sample yet
+        string tempErr;
         readonly System.Windows.Forms.Timer liveTimer = new System.Windows.Forms.Timer { Interval = 2000 };
         uint[] cpuVals;                                        // max CPU battery/AC, boost battery/AC
         int bright = -1, hz;
@@ -2534,7 +2608,42 @@ namespace SnapControl
             if (p == 2 && drivers == null) LoadDrivers();
             if (p == 3) { if (qcRows == null) qcRows = Soc.QualcommDrivers(); RefreshSoc(); liveTimer.Start(); }
             else liveTimer.Stop();
+            if (p == 3 || p == 5) StartTemps(); else StopTemps();
             if (p == 4) RefreshControls();
+            if (p == 5) mode = PowerMode.Current();
+        }
+
+        void StartTemps()
+        {
+            if (tempPipe != null) return;
+            string name = "SnapControl.Temps." + Guid.NewGuid().ToString("N");
+            var pipe = new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.In, 1);
+            tempPipe = pipe;
+            tempErr = null;
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--temps " + name) { Verb = "runas", UseShellExecute = true }).Dispose(); }
+            catch (Exception ex) { StopTemps(); tempErr = ex.Message; return; }
+            // shortcut: if the helper dies before connecting this thread waits forever; add a timeout if that ever happens
+            Background(delegate
+            {
+                try
+                {
+                    pipe.WaitForConnection();
+                    using (var r = new System.IO.StreamReader(pipe))
+                        for (string line; (line = r.ReadLine()) != null; )
+                        {
+                            var t = Thermal.Parse(line);
+                            BeginInvoke((MethodInvoker)delegate { if (tempPipe == pipe) { temps = t; if (page == 3 || page == 5) Invalidate(); } });
+                        }
+                }
+                catch (Exception) { }   // pipe closed by StopTemps or the window is gone
+            });
+        }
+
+        void StopTemps()
+        {
+            if (tempPipe == null) return;
+            tempPipe.Dispose();
+            tempPipe = null;
         }
 
         // WMI counters can take a few hundred ms: read off the window thread.
@@ -2824,7 +2933,8 @@ namespace SnapControl
             else if (page == 1) PaintBattery(g, cx, cy, cw);
             else if (page == 2) PaintDrivers(g, cx, cy, cw, h - pad);
             else if (page == 3) PaintSoc(g, cx, cy, cw);
-            else PaintControls(g, cx, cy, cw);
+            else if (page == 4) PaintControls(g, cx, cy, cw);
+            else PaintThermal(g, cx, cy, cw);
         }
 
         void PaintBattery(Graphics g, int x, int y, int w)
@@ -2905,6 +3015,59 @@ namespace SnapControl
             using (var on = new SolidBrush(T.Accent)) g.FillRectangle(on, r.X, r.Bottom - fill, r.Width, fill);
         }
 
+        string TempSummary() { return TempSummary(-1); }
+
+        // group -1 = all zones, otherwise Thermal.Group
+        string TempSummary(int group)
+        {
+            if (tempErr != null) return L.T("n/a · ", "n/d · ") + tempErr;
+            if (temps == null) return L.T("reading…", "lettura…");
+            double max = double.MinValue, sum = 0;
+            int n = 0;
+            foreach (var t in temps)
+                if (group < 0 || Thermal.Group(t.Key) == group) { max = Math.Max(max, t.Value); sum += t.Value; n++; }
+            if (n == 0) return L.T("n/a", "n/d");
+            return "max " + max.ToString("0") + " °C  ·  " + L.T("average ", "media ") + (sum / n).ToString("0") + " °C";
+        }
+
+        void PaintThermal(Graphics g, int x, int y, int w)
+        {
+            var rows = new List<string[]>
+            {
+                new[] { "CPU", TempSummary(0) },
+                new[] { L.T("CHASSIS", "SCOCCA"), TempSummary(1) },
+                new[] { "ADC", TempSummary(2) },
+            };
+            if (temps != null && temps.Exists(t => Thermal.Group(t.Key) == 3)) rows.Add(new[] { L.T("OTHER", "ALTRE"), TempSummary(3) });
+            rows.Add(new[] { L.T("FAN", "VENTOLA"), L.T("not available · speed is only in the EC", "non disponibile · velocità solo nell'EC") });
+            y = Rows(g, x, y, w, rows);
+
+            // thermal zones, grouped by ACPI device
+            if (temps != null && temps.Count > 0)
+            {
+                int cell = Px(96), labelW0 = Px(170), lh = Px(22);
+                int perRow = Math.Max(1, (w - labelW0) / cell), lines = (temps.Count + perRow - 1) / perRow;
+                using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, lines * lh + Px(12)));
+                Txt(g, L.T("THERMAL ZONES", "ZONE TERMICHE"), fMonoSmall, T.Muted, new Rectangle(x, y + Px(6), labelW0, lh));
+                for (int i = 0; i < temps.Count; i++)
+                    Txt(g, temps[i].Key + " " + temps[i].Value.ToString("0"), fMono, temps[i].Value >= 80 ? T.Accent : T.Text,
+                        new Rectangle(x + labelW0 + (i % perRow) * cell, y + Px(6) + (i / perRow) * lh, cell, lh));
+                y += lines * lh + Px(12);
+                HLine(g, x, x + w, y, T.Line);
+            }
+            y += Px(26);
+
+            Txt(g, L.T("POWER MODE", "MODALITÀ ENERGIA"), fMonoSmall, T.Muted, new Rectangle(x, y, w, Px(16)));
+            y += Px(22);
+            int bx = PillButton(g, x, y, L.T("EFFICIENCY", "EFFICIENZA"), mode == PowerMode.Efficiency, delegate { SetMode(PowerMode.Efficiency); }).Right + Px(8);
+            bx = PillButton(g, bx, y, L.T("BALANCED", "BILANCIATA"), mode == PowerMode.Balanced, delegate { SetMode(PowerMode.Balanced); }).Right + Px(8);
+            PillButton(g, bx, y, L.T("PERFORMANCE", "PRESTAZIONI"), mode == PowerMode.Performance, delegate { SetMode(PowerMode.Performance); });
+            y += Px(56);
+
+            using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, Px(20)));
+            Txt(g, L.T("Updates every 2 s · ACPI thermal zones · no fan speed in Windows", "Aggiornamento ogni 2 s · zone termiche ACPI · Windows non riceve la velocità ventola"), fMono, T.Muted, new Rectangle(x, y, w, Px(20)));
+        }
+
         void PaintSoc(Graphics g, int x, int y, int w)
         {
             var s = soc ?? new SocSample();
@@ -2913,6 +3076,7 @@ namespace SnapControl
                 new[] { "CPU Oryon", s.Cpu + "%  ·  " + (s.MHz / 1000.0).ToString("0.00") + " GHz  ·  " + L.T("performance ", "prestazioni ") + s.Perf + "%" },
                 new[] { "GPU Adreno", s.Gpu3d + "% 3D  ·  " + s.GpuCompute + L.T("% compute  ·  ", "% calcolo  ·  ") + s.GpuVideo + "% video  ·  " + s.GpuSharedMb + " MB" },
                 new[] { "NPU Hexagon", s.Npu + "%" },
+                new[] { L.T("TEMPERATURE", "TEMPERATURE"), TempSummary() },
             });
 
             // per-core load, one column each
@@ -2936,7 +3100,7 @@ namespace SnapControl
             Txt(g, L.T("QUALCOMM DRIVERS", "DRIVER QUALCOMM"), fMonoSmall, T.Accent, new Rectangle(x, y, w, Px(18)));
             y += Px(24);
             y = Rows(g, x, y, w, qcRows ?? new List<string[]>()) + Px(12);
-            string note = L.T("Updates every 2 s · Qualcomm does not expose temperatures or GPU/NPU clocks", "Aggiornamento ogni 2 s · temperature e clock GPU/NPU non sono esposti da Qualcomm");
+            string note = L.T("Updates every 2 s · temperatures from ACPI thermal zones · GPU/NPU clocks are not exposed by Qualcomm", "Aggiornamento ogni 2 s · temperature dalle zone termiche ACPI · clock GPU/NPU non esposti da Qualcomm");
             if (updates != null)
             {
                 int n = updates.FindAll(u => (u.Provider ?? "").Contains("Qualcomm") || (u.Title ?? "").Contains("Qualcomm")).Count;
@@ -3275,6 +3439,13 @@ namespace SnapControl
                 L.It = Settings.Italian;
                 try { Environment.ExitCode = Lenovo.RunBios(args[1]); }
                 catch (Exception ex) { Environment.ExitCode = 1; MessageBox.Show(L.T("BIOS package refused: ", "Pacchetto BIOS rifiutato: ") + ex.Message, "SnapControl"); }
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--temps")
+            {
+                // Elevated process started by the window: streams thermal zones until the window closes the pipe.
+                if (!System.Text.RegularExpressions.Regex.IsMatch(args[1], "^SnapControl\\.Temps\\.[0-9a-f]{32}$")) { Environment.ExitCode = 1; return; }
+                try { Thermal.Run(args[1]); } catch (Exception) { Environment.ExitCode = 1; }
                 return;
             }
             if (args.Length == 2 && args[0] == "--charge-limit")
