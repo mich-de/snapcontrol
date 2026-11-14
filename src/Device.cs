@@ -605,6 +605,7 @@ namespace SnapControl
         [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayDefault(int scope, LUID adapter, uint source, int type, int subtype, out IntPtr name);
         [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayUserScope(LUID adapter, uint source, out int scope);
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr mem);
+        [DllImport("mscms.dll", CharSet = CharSet.Unicode)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool InstallColorProfileW(string machine, string profile);
 
         const int CptIcc = 0, CpstStandard = 7, CpstExtended = 8;
 
@@ -613,6 +614,57 @@ namespace SnapControl
             public string Panel = "", Code = "", Sdr = "", Advanced = "", Error;
             public bool AdvancedSupported, AdvancedOn, PerUser;
             public List<string> Files = new List<string>();     // file names, e.g. TPLCD_8AC2_sRGB.icm
+            public int Saved;                                   // profiles in the backup
+            public List<string> Missing = new List<string>();   // in the backup, no longer installed
+        }
+
+        // Copy of the factory profiles kept by SnapControl: X-Rite's uninstaller may remove the originals.
+        public static string BackupDir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SnapControl\color"); } }
+
+        static readonly System.Text.RegularExpressions.Regex FileRx = new System.Text.RegularExpressions.Regex(@"^TPLCD_[0-9A-Fa-f]{4}_[A-Za-z0-9]+(\.icm|_Quality\.txt)$");
+
+        // Saves the panel's profiles and quality reports that are not saved yet (or changed).
+        static void Backup(string code)
+        {
+            string[] src = System.IO.Directory.GetFiles(Dir, "TPLCD_" + code + "_*");
+            if (src.Length == 0) return;
+            System.IO.Directory.CreateDirectory(BackupDir);
+            foreach (string f in src)
+            {
+                string name = System.IO.Path.GetFileName(f), dst = System.IO.Path.Combine(BackupDir, name);
+                if (!FileRx.IsMatch(name)) continue;
+                if (System.IO.File.Exists(dst) && new System.IO.FileInfo(dst).Length == new System.IO.FileInfo(f).Length) continue;
+                System.IO.File.Copy(f, dst, true);
+            }
+        }
+
+        // ICC header: "acsp" at byte 36, declared size equal to the file size.
+        static bool IccValid(string path)
+        {
+            byte[] b = System.IO.File.ReadAllBytes(path);
+            if (b.Length < 132 || b.Length > 1 << 20 || Encoding.ASCII.GetString(b, 36, 4) != "acsp") return false;
+            long size = ((long)b[0] << 24) | ((long)b[1] << 16) | ((long)b[2] << 8) | b[3];
+            return size == b.Length;
+        }
+
+        // Elevated (--color-restore): installs back the saved profiles that are missing. Only TPLCD_*.icm files
+        // with a valid ICC header are installed, through the Windows API that copies them into the color folder.
+        public static int Restore(string dir)
+        {
+            int n = 0;
+            foreach (string f in System.IO.Directory.GetFiles(dir, "TPLCD_*"))
+            {
+                string name = System.IO.Path.GetFileName(f), dst = System.IO.Path.Combine(Dir, name);
+                if (!FileRx.IsMatch(name) || System.IO.File.Exists(dst)) continue;
+                if (name.EndsWith(".icm", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!IccValid(f)) throw new Exception(L.T("not a valid ICC profile: ", "profilo ICC non valido: ") + name);
+                    if (!InstallColorProfileW(null, f)) throw new System.ComponentModel.Win32Exception();
+                    n++;
+                }
+                else if (new System.IO.FileInfo(f).Length < 1 << 20) System.IO.File.Copy(f, dst);
+            }
+            return n;
         }
 
         static string Dir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"spool\drivers\color"); } }
@@ -677,8 +729,18 @@ namespace SnapControl
             try
             {
                 if (st.Code.Length > 0)
+                {
                     foreach (string f in System.IO.Directory.GetFiles(Dir, "TPLCD_" + st.Code + "_*.icm"))
                         st.Files.Add(System.IO.Path.GetFileName(f));
+                    try { Backup(st.Code); } catch { }
+                    if (System.IO.Directory.Exists(BackupDir))
+                        foreach (string f in System.IO.Directory.GetFiles(BackupDir, "TPLCD_" + st.Code + "_*.icm"))
+                        {
+                            st.Saved++;
+                            string name = System.IO.Path.GetFileName(f);
+                            if (!st.Files.Exists(x => x.Equals(name, StringComparison.OrdinalIgnoreCase))) st.Missing.Add(name);
+                        }
+                }
                 st.Files.Sort(StringComparer.OrdinalIgnoreCase);
 
                 LUID a, ta; uint s, t;
@@ -689,27 +751,34 @@ namespace SnapControl
                 st.Sdr = Default(scope, a, s, CpstStandard);
                 st.Advanced = Default(scope, a, s, CpstExtended);
 
-                // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO (type 9): header 20 bytes + value + encoding + bits
-                IntPtr pk = Marshal.AllocHGlobal(32);
-                try
-                {
-                    for (int i = 0; i < 32; i += 4) Marshal.WriteInt32(pk, i, 0);
-                    Marshal.WriteInt32(pk, 0, 9);
-                    Marshal.WriteInt32(pk, 4, 32);
-                    Marshal.WriteInt32(pk, 8, (int)ta.Low);
-                    Marshal.WriteInt32(pk, 12, ta.High);
-                    Marshal.WriteInt32(pk, 16, (int)t);
-                    if (DisplayConfigGetDeviceInfo(pk) == 0)
-                    {
-                        int v = Marshal.ReadInt32(pk, 20);
-                        st.AdvancedSupported = (v & 1) != 0;
-                        st.AdvancedOn = (v & 2) != 0;
-                    }
-                }
-                finally { Marshal.FreeHGlobal(pk); }
+                ReadAdvanced(st);
             }
             catch (Exception ex) { st.Error = ex.Message; }
             return st;
+        }
+
+        static void ReadAdvanced(State st)
+        {
+            LUID a, ta; uint s, t;
+            if (!Target(out a, out s, out ta, out t)) return;
+            // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO (type 9): header 20 bytes + value + encoding + bits
+            IntPtr pk = Marshal.AllocHGlobal(32);
+            try
+            {
+                for (int i = 0; i < 32; i += 4) Marshal.WriteInt32(pk, i, 0);
+                Marshal.WriteInt32(pk, 0, 9);
+                Marshal.WriteInt32(pk, 4, 32);
+                Marshal.WriteInt32(pk, 8, (int)ta.Low);
+                Marshal.WriteInt32(pk, 12, ta.High);
+                Marshal.WriteInt32(pk, 16, (int)t);
+                if (DisplayConfigGetDeviceInfo(pk) == 0)
+                {
+                    int v = Marshal.ReadInt32(pk, 20);
+                    st.AdvancedSupported = (v & 1) != 0;
+                    st.AdvancedOn = (v & 2) != 0;
+                }
+            }
+            finally { Marshal.FreeHGlobal(pk); }
         }
 
         // Sets the profile as the display default; also for advanced color when Windows uses it on this panel.
@@ -722,8 +791,17 @@ namespace SnapControl
             int scope;
             if (ColorProfileGetDisplayUserScope(a, s, out scope) != 0) scope = 1;
             Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, false));
-            var st = Read();
-            if (st.AdvancedOn) Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, true));
+            if (AdvancedOn()) Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, true));
+            try { using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Settings.Key)) k.SetValue("ColorProfile", file); } catch { }
+        }
+
+        static bool AdvancedOn() { var st = new State(); ReadAdvanced(st); return st.AdvancedOn; }
+
+        // Last profile chosen in SnapControl, set again after a restore.
+        public static string Saved()
+        {
+            try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(Settings.Key)) return (k == null ? null : k.GetValue("ColorProfile") as string) ?? ""; }
+            catch { return ""; }
         }
 
         // "TPLCD_8AC2_DisplayP3.icm" -> "DisplayP3"
@@ -782,6 +860,12 @@ namespace SnapControl
 
         public static int Cli(string[] a)
         {
+            if (a.Length == 2 && a[0] == "--color-restore")
+            {
+                // elevated process started by the window
+                try { Restore(a[1]); return 0; }
+                catch (Exception ex) { System.Windows.Forms.MessageBox.Show("Profili colore: " + ex.Message, "SnapControl"); return 1; }
+            }
             var sb = new StringBuilder();
             int code = 0;
             try
@@ -792,6 +876,7 @@ namespace SnapControl
                 sb.Append("pannello " + st.Panel + " · per utente " + st.PerUser + " · colore avanzato supportato " + st.AdvancedSupported + " attivo " + st.AdvancedOn + "\n");
                 sb.Append("predefinito SDR: " + st.Sdr + "\npredefinito avanzato: " + st.Advanced + "\n");
                 foreach (var f in st.Files) sb.Append((f.Equals(st.Sdr, StringComparison.OrdinalIgnoreCase) ? "* " : "  ") + f + "  (" + Label(Mode(f)) + ")\n");
+                sb.Append("copia di sicurezza: " + st.Saved + " profili in " + BackupDir + (st.Missing.Count > 0 ? " · mancanti: " + string.Join(", ", st.Missing) : "") + "\n");
                 var x = XRiteAtStartup();
                 sb.Append("X-Rite all'avvio: " + (x == null ? "attivita' assente" : x.Value ? "si" : "no") + "\n");
                 if (st.Error != null) { sb.Append("errore: " + st.Error + "\n"); code = 2; }

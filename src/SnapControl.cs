@@ -3478,6 +3478,34 @@ namespace SnapControl
             });
         }
 
+        // The color folder is in System32: installing needs administrator rights.
+        void RestoreColor()
+        {
+            if (colorBusy) return;
+            colorBusy = true;
+            string active = ColorProfiles.Saved();
+            if (active.Length == 0 && colorSt != null) active = colorSt.Sdr;
+            Background(delegate
+            {
+                string err = null;
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--color-restore \"" + ColorProfiles.BackupDir + "\"") { Verb = "runas", UseShellExecute = true };
+                    using (var p = System.Diagnostics.Process.Start(psi)) { p.WaitForExit(); if (p.ExitCode != 0) err = L.T("restore failed", "ripristino non riuscito"); }
+                }
+                catch (System.ComponentModel.Win32Exception) { err = L.T("administrator permission not granted", "permesso di amministratore non concesso"); }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    colorBusy = false;
+                    devStatus = err == null ? (Func<string>)(() => L.T("Profiles restored", "Profili ripristinati")) : () => L.T("Color profiles: ", "Profili colore: ") + err;
+                    // the default may have been lost with the files: set it again
+                    if (err == null && active.Length > 0) try { ColorProfiles.Set(active); } catch { }
+                    RefreshDevice();
+                    Invalidate();
+                });
+            });
+        }
+
         int PaintColor(Graphics g, int x, int y, int w)
         {
             var st = colorSt;
@@ -3503,6 +3531,15 @@ namespace SnapControl
                 }
                 y += Px(52);
             }
+
+            if (st.Missing.Count > 0)
+            {
+                Note(g, x, y, w, st.Missing.Count + L.T(" saved profiles are no longer installed (removed with X-Rite?)", " profili salvati non sono più installati (rimossi con X-Rite?)"), T.Accent);
+                y += Px(28);
+                PillButton(g, x, y, L.T("RESTORE PROFILES", "RIPRISTINA PROFILI"), false, colorBusy ? null : (Action)RestoreColor);
+                y += Px(52);
+            }
+            else if (st.Saved > 0) { Note(g, x, y, w, L.T("Backup: ", "Copia di sicurezza: ") + st.Saved + L.T(" profiles in ", " profili in ") + ColorProfiles.BackupDir, T.Muted); y += Px(34); }
 
             y = Section(g, x, y, w, "X-RITE COLOR ASSISTANT");
             if (xriteStart == null) { Note(g, x, y, w, L.T("Not installed: profiles stay applied by Windows", "Non installato: i profili restano applicati da Windows"), T.Muted); y += Px(30); }
