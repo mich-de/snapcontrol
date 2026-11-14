@@ -170,7 +170,7 @@ namespace SnapControl.Setup
             lnk.TargetPath = Exe;
             lnk.WorkingDirectory = Dir;
             lnk.IconLocation = Exe + ",0";
-            lnk.Description = "Battery, power and drivers for IdeaPad Slim 5 14Q8X9";
+            lnk.Description = "Battery, power, drivers and device settings for Lenovo Snapdragon X laptops";
             lnk.Save();
         }
     }

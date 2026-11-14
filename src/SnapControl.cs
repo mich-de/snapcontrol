@@ -1,4 +1,4 @@
-﻿// SnapControl - lightweight control panel for Lenovo IdeaPad Slim 5 14Q8X9 (Snapdragon X Plus, ARM64).
+﻿// SnapControl - lightweight control panel for Lenovo Snapdragon X laptops (IdeaPad Slim 5 14Q8X9, Yoga Slim 7 14Q8X9), ARM64.
 // No networking, except the user-started BIOS/driver search (Windows Update, Lenovo API, Microsoft catalog). No telemetry.
 // Built with the .NET Framework 4.8.1 csc (C# 5) shipped with Windows: runs native ARM64.
 using System;
@@ -14,7 +14,7 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("SnapControl")]
 [assembly: System.Reflection.AssemblyCompany("mich-de")]
 [assembly: System.Reflection.AssemblyCopyright("mich-de - github.com/mich-de/snapcontrol")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
 // Without this attribute .NET 4.8.1 starts AnyCPU apps under x64 emulation even on ARM64.
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8.1", FrameworkDisplayName = ".NET Framework 4.8.1")]
 
@@ -827,7 +827,7 @@ namespace SnapControl
         }
 
         // Updates from official vendor channels, only on user request:
-        // Windows Update (where Lenovo publishes certified drivers for the 83HL), the Lenovo download API (BIOS and drivers)
+        // Windows Update (where Lenovo publishes certified drivers for the machine type), the Lenovo download API (BIOS and drivers)
         // and the Microsoft Update Catalog.
         public static List<UpdateItem> SearchUpdates(List<Func<string>> notes)
         {
@@ -1221,22 +1221,64 @@ namespace SnapControl
     }
 
     // Public pcsupport.lenovo.com API (the same as the download page) for the machine type:
-    // BIOS and drivers. The Lenovo System Update catalog for the 83HL is empty, this API is not.
+    // BIOS and drivers. The Lenovo System Update catalog for these models is empty, this API is not.
     // The BIOS appears only if newer than the installed one; diagnostics and generic utilities are excluded.
     static class Lenovo
     {
+        static string machineType;
+
+        // First 4 characters of the model (e.g. 83ED); read once, the top bar and the Drivers page ask on every paint.
         public static string MachineType()
         {
+            if (machineType != null) return machineType;
             using (var s = new ManagementObjectSearcher("SELECT Model FROM Win32_ComputerSystem"))
                 foreach (ManagementObject o in s.Get())
                 {
                     string m = Convert.ToString(o["Model"]) ?? "";
-                    return m.Length >= 4 ? m.Substring(0, 4).ToUpperInvariant() : m;
+                    return machineType = m.Length >= 4 ? m.Substring(0, 4).ToUpperInvariant() : m;
                 }
             return "";
         }
 
-        public static string SupportPage { get { return "https://pcsupport.lenovo.com/products/laptops-and-netbooks/ideapad-s-series-netbooks/ideapad-slim-5-14q8x9/83hl/downloads/driver-list"; } }
+        static string productId;   // e.g. LAPTOPS-AND-NETBOOKS/YOGA-SERIES/YOGA-SLIM-7-14Q8X9/83ED[/83ED0024IX/PF56ZJ2D]
+
+        // Lenovo product slug: by serial number first (it also gives the full model), then by machine type.
+        // Network use started by a button only: the serial number is sent to Lenovo.
+        public static string ProductId()
+        {
+            if (productId != null) return productId;
+            System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12 | (System.Net.SecurityProtocolType)12288;
+            var json = new System.Web.Script.Serialization.JavaScriptSerializer();
+            using (var wc = new System.Net.WebClient())
+            {
+                wc.Encoding = Encoding.UTF8;
+                foreach (string q in new[] { DeviceInfo.Serial(), MachineType() })
+                {
+                    if (string.IsNullOrEmpty(q) || !System.Text.RegularExpressions.Regex.IsMatch(q, "^[A-Za-z0-9]{4,12}$")) continue;
+                    wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "Mozilla/5.0";
+                    wc.Headers[System.Net.HttpRequestHeader.Referer] = "https://pcsupport.lenovo.com/";
+                    object prod = json.DeserializeObject(wc.DownloadString(Api + "mse/getproducts?productId=" + Uri.EscapeDataString(q)));
+                    var arr = prod as object[];
+                    if (arr != null) prod = arr.Length > 0 ? arr[0] : null;
+                    string id = Convert.ToString(J(prod, "Id"));
+                    if (!string.IsNullOrEmpty(id)) { productId = id; return id; }
+                }
+            }
+            throw new Exception(L.T("machine type " + MachineType() + " unknown to Lenovo", "tipo macchina " + MachineType() + " sconosciuto a Lenovo"));
+        }
+
+        // suffix: "" (product home), "/warranty", "/parts", "/downloads/driver-list"
+        public static string ProductUrl(string suffix) { return "https://pcsupport.lenovo.com/products/" + ProductId().ToLowerInvariant() + suffix; }
+
+        // Full model (e.g. 83ED0024IX), known only after a lookup by serial number; Windows exposes the first 4 characters.
+        public static string FullModel()
+        {
+            if (productId == null) return null;
+            string mt = MachineType();
+            foreach (string seg in productId.Split('/'))
+                if (seg.Length == 10 && mt.Length == 4 && seg.StartsWith(mt, StringComparison.OrdinalIgnoreCase)) return seg.ToUpperInvariant();
+            return null;
+        }
 
         const string Api = "https://pcsupport.lenovo.com/us/en/api/v4/";
         static readonly string[] SkipCategories = { "Diagnostic", "Software and Utilities", "ThinkVantage Technology", "Tool" };
@@ -2072,8 +2114,8 @@ namespace SnapControl
 
     sealed class MainForm : Form
     {
-        static string[] Pages { get { return new[] { L.T("SYSTEM", "SISTEMA"), L.T("BATTERY", "BATTERIA"), L.T("DRIVERS", "DRIVER"), "SNAPDRAGON", L.T("CONTROLS", "CONTROLLI"), L.T("THERMAL", "TERMICA") }; } }
-        static string[] Titles { get { return new[] { L.T("System", "Sistema"), L.T("Battery", "Batteria"), L.T("Drivers", "Driver"), "Snapdragon", L.T("Controls", "Controlli"), L.T("Thermal", "Termica") }; } }
+        static string[] Pages { get { return new[] { L.T("SYSTEM", "SISTEMA"), L.T("BATTERY", "BATTERIA"), L.T("DRIVERS", "DRIVER"), "SNAPDRAGON", L.T("CONTROLS", "CONTROLLI"), L.T("THERMAL", "TERMICA"), L.T("DEVICE", "DISPOSITIVO") }; } }
+        static string[] Titles { get { return new[] { L.T("System", "Sistema"), L.T("Battery", "Batteria"), L.T("Drivers", "Driver"), "Snapdragon", L.T("Controls", "Controlli"), L.T("Thermal", "Termica"), L.T("Device", "Dispositivo") }; } }
 
         int themeIdx = Theme.Load();
         int page = 1;
@@ -2112,6 +2154,14 @@ namespace SnapControl
         bool ctlApps;                                          // Controls page: per-app usage view
         bool appBusy;
         List<string[]> appRows;
+        int devView;                                           // Device page: 0 details, 1 audio, 2 network
+        List<string[]> devRows, audioProc, ifRows;
+        List<Audio.Endpoint> audioEps;
+        List<NetInfo.Wifi> wifi;
+        List<string> btRows;
+        uint[] wifiSave;                                       // Wi-Fi power saving AC, DC
+        bool lenovoBusy, audioTesting;
+        Func<string> devStatus = () => "";
         Func<string> appStatus = () => L.T("Press REFRESH to read the data: administrator permission is required", "Premi AGGIORNA per leggere i dati: serve il permesso di amministratore");
 
         readonly List<KeyValuePair<Rectangle, Action>> hits = new List<KeyValuePair<Rectangle, Action>>();
@@ -2149,6 +2199,8 @@ namespace SnapControl
                 UpdateTray();
                 if (page == 1 && Visible && WindowState != FormWindowState.Minimized) Invalidate();
                 if (page == 4 && ctlPower && Visible && WindowState != FormWindowState.Minimized) { RefreshPower(); Invalidate(); }
+                // audio and Wi-Fi change outside the app (keys, flyout, roaming): reread while visible
+                if (page == 6 && devView > 0 && Visible && WindowState != FormWindowState.Minimized) { RefreshDevice(); Invalidate(); }
             };
             liveTimer.Tick += delegate { if (page == 3 && Visible && WindowState != FormWindowState.Minimized) RefreshSoc(); };
             Shown += delegate { Init(); Invalidate(); };
@@ -2253,6 +2305,7 @@ namespace SnapControl
             RefreshSystem();
             TrayTexts();
             UpdateTray();
+            if (page == 6) RefreshDevice();
         }
 
         void DisposeTray()
@@ -2545,6 +2598,11 @@ namespace SnapControl
             sb.AppendLine(L.T("== Controls ==", "== Controlli =="));
             sb.AppendLine(L.T("Max CPU battery/AC: ", "Max CPU batteria/rete: ") + cpuVals[0] + "/" + cpuVals[1] + L.T(" · boost battery/AC: ", " · boost batteria/rete: ") + cpuVals[2] + "/" + cpuVals[3]);
             sb.AppendLine(L.T("Brightness ", "Luminosità ") + bright + "% · " + hz + L.T(" Hz · available: ", " Hz · disponibili: ") + string.Join(", ", rates));
+            sb.AppendLine(L.T("== Device ==", "== Dispositivo =="));
+            foreach (var r in DeviceInfo.Rows(Lenovo.FullModel())) sb.AppendLine(L.T(r[2], r[0]).PadRight(16) + r[1]);
+            try { foreach (var e in Audio.Read()) sb.AppendLine((e.Flow == Audio.Render ? "OUT " : "IN  ") + (e.Default ? "* " : "  ") + e.Name + " · " + e.Volume + "%" + (e.Mute ? " mute" : "") + " · [" + string.Join(" ", e.Channels) + "]"); }
+            catch (Exception ex) { sb.AppendLine("audio: " + ex.Message); }
+            foreach (var w in NetInfo.ReadWifi()) sb.AppendLine("Wi-Fi " + w.Adapter + " · " + w.State + (w.Connected ? " · " + w.Standard + " · " + NetInfo.Band(w) + " ch " + w.Channel + " · " + w.Signal + "% " + w.Rssi + " dBm · " + w.Rx + "/" + w.Tx + " Mbps" : ""));
             return sb.ToString();
         }
 
@@ -2611,6 +2669,7 @@ namespace SnapControl
             if (p == 3 || p == 5) StartTemps(); else StopTemps();
             if (p == 4) RefreshControls();
             if (p == 5) mode = PowerMode.Current();
+            if (p == 6) RefreshDevice();
         }
 
         void StartTemps()
@@ -2892,7 +2951,7 @@ namespace SnapControl
 
             int subX = Px(20) + TxtW("SNAPCONTROL", fMonoBold) + Px(12);
             Txt(g, "SNAPCONTROL", fMonoBold, T.Text, new Rectangle(Px(20), 0, Px(120), barH));
-            Txt(g, "//  IDEAPAD SLIM 5 14Q8X9  ·  SNAPDRAGON X PLUS", fMono, T.Muted, new Rectangle(subX, 0, Math.Max(0, ck.X - Px(12) - subX), barH));
+            Txt(g, "//  " + DeviceInfo.Headline, fMono, T.Muted, new Rectangle(subX, 0, Math.Max(0, ck.X - Px(12) - subX), barH));
             using (var path = Pill(pr))
             {
                 if (pr == hover) using (var b = new SolidBrush(T.Band)) g.FillPath(b, path);
@@ -2934,7 +2993,8 @@ namespace SnapControl
             else if (page == 2) PaintDrivers(g, cx, cy, cw, h - pad);
             else if (page == 3) PaintSoc(g, cx, cy, cw);
             else if (page == 4) PaintControls(g, cx, cy, cw);
-            else PaintThermal(g, cx, cy, cw);
+            else if (page == 5) PaintThermal(g, cx, cy, cw);
+            else PaintDevice(g, cx, cy, cw);
         }
 
         void PaintBattery(Graphics g, int x, int y, int w)
@@ -3226,6 +3286,198 @@ namespace SnapControl
             return ControlRow(g, x, y, w, label, names, values.ToArray(), current, set, 160, 20, 40, r.Name == "sospensione" && other == 0 ? 0 : uint.MaxValue);
         }
 
+        // ---------------------------------------------------------------- device (details, audio, network)
+
+        void RefreshDevice()
+        {
+            if (devView == 0) devRows = DeviceInfo.Rows(Lenovo.FullModel());
+            else if (devView == 1)
+            {
+                try { audioEps = Audio.Read(); }
+                catch (Exception ex) { audioEps = new List<Audio.Endpoint>(); devStatus = () => L.T("Audio unreadable: ", "Audio non leggibile: ") + ex.Message; }
+                if (audioProc == null) audioProc = Audio.Processing();
+            }
+            else
+            {
+                wifi = NetInfo.ReadWifi();
+                ifRows = NetInfo.Interfaces();
+                btRows = NetInfo.Bluetooth();
+                wifiSave = new[] { NetInfo.WifiSaving(true), NetInfo.WifiSaving(false) };
+            }
+        }
+
+        // Lenovo pages built from this PC's product slug; without network the generic page opens.
+        void OpenLenovo(string suffix, string fallback)
+        {
+            if (lenovoBusy) return;
+            lenovoBusy = true;
+            devStatus = () => L.T("Asking Lenovo for this product's page (the serial number is sent to Lenovo)…", "Richiesta a Lenovo della pagina di questo prodotto (il numero di serie viene inviato a Lenovo)…");
+            Invalidate();
+            Background(delegate
+            {
+                string url = fallback, err = null;
+                try { url = Lenovo.ProductUrl(suffix); }
+                catch (Exception ex) { err = ex.Message.Trim(); }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    lenovoBusy = false;
+                    Open(url);
+                    if (err == null) devStatus = () => L.T("Opened in the browser: ", "Aperto nel browser: ") + url;
+                    else devStatus = () => L.T("Lenovo unreachable, generic page opened (", "Lenovo non raggiungibile, aperta la pagina generica (") + err + ")";
+                    if (devView == 0) devRows = DeviceInfo.Rows(Lenovo.FullModel());
+                    Invalidate();
+                });
+            });
+        }
+
+        void AudioDo(string what, Action a)
+        {
+            try { a(); devStatus = () => ""; }
+            catch (Exception ex) { devStatus = () => L.T("Could not change ", "Impossibile cambiare ") + what + ": " + ex.Message; }
+            RefreshDevice();
+        }
+
+        void Note(Graphics g, int x, int y, int w, string s, Color c)
+        {
+            using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, Px(20)));
+            Txt(g, s, fMono, c, new Rectangle(x, y, w, Px(20)));
+        }
+
+        // Section title in the LED color, like the Controls page.
+        int Section(Graphics g, int x, int y, int w, string s)
+        {
+            using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, Px(18)));
+            Txt(g, s, fMonoSmall, T.Accent, new Rectangle(x, y, w, Px(18)));
+            return y + Px(26);
+        }
+
+        void PaintDevice(Graphics g, int x, int y, int w)
+        {
+            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null)) RefreshDevice();
+            int sx = PillButton(g, x, y, L.T("DETAILS", "DETTAGLI"), devView == 0, delegate { devView = 0; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
+            sx = PillButton(g, sx, y, "AUDIO", devView == 1, delegate { devView = 1; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
+            PillButton(g, sx, y, L.T("NETWORK", "RETE"), devView == 2, delegate { devView = 2; devStatus = () => ""; RefreshDevice(); });
+            y += Px(46);
+            if (devView == 0) y = PaintDetails(g, x, y, w);
+            else if (devView == 1) y = PaintAudio(g, x, y, w);
+            else y = PaintNetwork(g, x, y, w);
+            string st = devStatus();
+            if (st.Length > 0) Note(g, x, y, w, st, T.Muted);
+        }
+
+        int PaintDetails(Graphics g, int x, int y, int w)
+        {
+            y = Rows(g, x, y, w, devRows) + Px(16);
+            int bx = x;
+            Action<string, Action> pill = (label, act) =>
+            {
+                if (bx > x && bx + TxtW(label, fMono) + Px(36) > x + w) { bx = x; y += Px(42); }
+                bx = PillButton(g, bx, y, label, false, act).Right + Px(8);
+            };
+            Action busy = null;
+            pill(L.T("WARRANTY ↗", "GARANZIA ↗"), lenovoBusy ? busy : delegate { OpenLenovo("/warranty", "https://pcsupport.lenovo.com/warrantylookup"); });
+            pill(L.T("SPARE PARTS ↗", "RICAMBI ↗"), lenovoBusy ? busy : delegate { OpenLenovo("/parts", "https://pcsupport.lenovo.com/partslookup"); });
+            pill(L.T("LENOVO SUPPORT ↗", "SUPPORTO LENOVO ↗"), lenovoBusy ? busy : delegate { OpenLenovo("", "https://pcsupport.lenovo.com/"); });
+            pill(L.T("COPY SERIAL", "COPIA SERIALE"), delegate
+            {
+                string sn = DeviceInfo.Serial();
+                try { Clipboard.SetText(sn); devStatus = () => L.T("Serial number copied: ", "Numero di serie copiato: ") + sn; }
+                catch (Exception ex) { devStatus = () => ex.Message; }
+            });
+            y += Px(46);
+            Note(g, x, y, w, L.T("Warranty, parts and support send the serial number to Lenovo, only when pressed", "Garanzia, ricambi e supporto inviano il numero di serie a Lenovo, solo quando li premi"), T.Muted);
+            return y + Px(26);
+        }
+
+        int PaintAudio(Graphics g, int x, int y, int w)
+        {
+            string[] volN = { "0", "25", "50", "75", "100" };
+            uint[] volV = { 0, 25, 50, 75, 100 };
+            foreach (int flow in new[] { Audio.Render, Audio.Capture })
+            {
+                y = Section(g, x, y, w, flow == Audio.Render ? L.T("OUTPUT · SPEAKERS", "USCITA · ALTOPARLANTI") : L.T("INPUT · MICROPHONES", "INGRESSO · MICROFONI"));
+                var list = audioEps.FindAll(e => e.Flow == flow);
+                var def = list.Find(e => e.Default);
+                if (def == null) { Note(g, x, y, w, L.T("No active device", "Nessun dispositivo attivo"), T.Muted); y += Px(30); continue; }
+                string ch = def.Channels.Count >= 2 ? L.T("  ·  L ", "  ·  S ") + def.Channels[0] + L.T("  R ", "  D ") + def.Channels[1] : "";
+                Note(g, x, y, w, def.Name + ch, T.Text);
+                y += Px(28);
+                uint near = volV[0];
+                foreach (uint v in volV) if (Math.Abs((int)v - def.Volume) < Math.Abs((int)near - def.Volume)) near = v;
+                string id = def.Id;
+                y = ControlRow(g, x, y, w, L.T("VOLUME · ", "VOLUME · ") + def.Volume + "%", volN, volV, near, v => AudioDo(L.T("the volume", "il volume"), delegate { Audio.SetVolume(id, (int)v); }), 200, 28);
+                bool mute = def.Mute;
+                int bx = x + Px(200);
+                bx = PillButton(g, bx, y, flow == Audio.Render ? L.T("MUTE", "MUTO") : L.T("MIC OFF", "MICROFONO SPENTO"), mute, delegate { AudioDo(L.T("mute", "il muto"), delegate { Audio.SetMute(id, !mute); }); }).Right + Px(8);
+                bool unbalanced = def.Channels.Count >= 2 && Math.Abs(def.Channels[0] - def.Channels[1]) > 2;
+                if (unbalanced) bx = PillButton(g, bx, y, L.T("CENTER L/R", "CENTRA S/D"), false, delegate { AudioDo(L.T("the balance", "il bilanciamento"), delegate { Audio.Center(id); }); }).Right + Px(8);
+                if (flow == Audio.Render)
+                {
+                    Action<int, string> test = (c, label) =>
+                    {
+                        bx = PillButton(g, bx, y, label, false, audioTesting ? (Action)null : delegate
+                        {
+                            audioTesting = true;
+                            Background(delegate
+                            {
+                                try { Audio.Test(c); } catch { }
+                                BeginInvoke((MethodInvoker)delegate { audioTesting = false; Invalidate(); });
+                            });
+                        }).Right + Px(8);
+                    };
+                    if (bx + TxtW("◀ TEST L  TEST R ▶", fMono) + Px(80) > x + w) { bx = x + Px(200); y += Px(44); }
+                    test(0, L.T("◀ TEST L", "◀ PROVA S"));
+                    test(1, L.T("TEST R ▶", "PROVA D ▶"));
+                }
+                y += Px(44);
+                if (unbalanced) { Note(g, x, y, w, L.T("Left and right are at different levels: one side sounds weaker", "Sinistra e destra hanno livelli diversi: un lato suona più piano"), T.Accent); y += Px(26); }
+                var others = list.FindAll(e => !e.Default);
+                if (others.Count > 0) { Note(g, x, y, w, L.T("Also active: ", "Attivi anche: ") + string.Join(", ", others.ConvertAll(e => e.Name)), T.Muted); y += Px(26); }
+                y += Px(8);
+            }
+            if (audioProc != null && audioProc.Count > 0)
+                y = Rows(g, x, y, w, audioProc.ConvertAll(r => new[] { r[0], L.T(r[3], r[1]), r[2] })) + Px(12);
+            PillButton(g, x, y, L.T("SOUND SETTINGS ↗", "IMPOSTAZIONI AUDIO ↗"), false, delegate { Open("ms-settings:sound"); });
+            return y + Px(46);
+        }
+
+        int PaintNetwork(Graphics g, int x, int y, int w)
+        {
+            var rows = new List<string[]>();
+            foreach (var wl in wifi)
+            {
+                rows.Add(new[] { "Wi-Fi", wl.Adapter + "  ·  " + wl.State, "Wi-Fi" });
+                if (!wl.Connected) continue;
+                rows.Add(new[] { "Rete", wl.Ssid + "  ·  " + wl.Security, "Network" });
+                rows.Add(new[] { "Segnale", (wl.Signal >= 0 ? wl.Signal + "%" : "?") + (wl.Rssi != 0 ? "  ·  " + wl.Rssi + " dBm" : "") + "  ·  ↓ " + wl.Rx + " / ↑ " + wl.Tx + " Mbps", "Signal" });
+                string band = NetInfo.Band(wl);
+                rows.Add(new[] { "Radio", wl.Standard + (band.Length > 0 ? "  ·  " + band : "") + (wl.Channel > 0 ? L.T("  ·  ch ", "  ·  canale ") + wl.Channel : "") + "  ·  " + wl.Bssid, "Radio" });
+            }
+            if (wifi.Count == 0) rows.Add(new[] { "Wi-Fi", L.T("no wireless adapter", "nessuna scheda wireless"), "Wi-Fi" });
+            foreach (var r in ifRows) rows.Add(new[] { r[0], r[1] + "  ·  " + r[2] });
+            if (btRows.Count == 0) rows.Add(new[] { "Bluetooth", L.T("no adapter", "nessun adattatore"), "Bluetooth" });
+            foreach (var b in btRows) rows.Add(new[] { "Bluetooth", b, "Bluetooth" });
+            y = Rows(g, x, y, w, rows) + Px(18);
+
+            y = Section(g, x, y, w, L.T("WI-FI POWER SAVING · ACTIVE POWER PLAN", "RISPARMIO ENERGIA WI-FI · PIANO ENERGIA ATTIVO"));
+            string[] n = { L.T("MAX PERFORMANCE", "PRESTAZIONI"), L.T("LOW", "BASSO"), L.T("MEDIUM", "MEDIO"), L.T("MAX SAVING", "MASSIMO") };
+            uint[] v = { 0, 1, 2, 3 };
+            var sub = new Guid("19cbb8fa-5279-450e-9fac-8a3d5fedd0c1");
+            var set = new Guid("12bbebe6-58d6-4636-95bb-3217ef867c1a");
+            for (int i = 0; i < 2; i++)
+            {
+                bool ac = i == 0;
+                Action<uint> write = null;
+                if (!noStandby) write = val => AudioDo(L.T("Wi-Fi power saving", "il risparmio Wi-Fi"), delegate { Soc.Write(sub, set, ac, val); });
+                y = ControlRow(g, x, y, w, ac ? L.T("WI-FI · AC", "WI-FI · RETE") : L.T("WI-FI · BATTERY", "WI-FI · BATTERIA"), n, v, wifiSave[i], write, 200, 28);
+            }
+            if (noStandby) { Note(g, x, y, w, L.T("Held at maximum performance by \"Never sleep\"", "Tenuto al massimo delle prestazioni da «Mai in standby»"), T.Muted); y += Px(26); }
+            y += Px(6);
+            int bx = PillButton(g, x, y, L.T("WI-FI SETTINGS ↗", "IMPOSTAZIONI WI-FI ↗"), false, delegate { Open("ms-settings:network-wifi"); }).Right + Px(8);
+            PillButton(g, bx, y, "BLUETOOTH ↗", false, delegate { Open("ms-settings:bluetooth"); });
+            return y + Px(46);
+        }
+
         void SetMode(Guid m)
         {
             uint r = Native.PowerSetActiveOverlayScheme(ref m);
@@ -3266,7 +3518,7 @@ namespace SnapControl
                     chosen.Count > 0 && !busy ? (Action)delegate { InstallUpdates(chosen.ConvertAll(u => u.Id)); } : null);
                 pill(L.T("INSTALL ALL", "INSTALLA TUTTI"), false, busy ? (Action)null : delegate { InstallUpdates(installable.ConvertAll(u => u.Id)); });
             }
-            pill(L.T("LENOVO 83HL PAGE ↗", "PAGINA LENOVO 83HL ↗"), false, delegate { Open(Lenovo.SupportPage); });
+            pill(L.T("LENOVO " + Lenovo.MachineType() + " PAGE ↗", "PAGINA LENOVO " + Lenovo.MachineType() + " ↗"), false, lenovoBusy ? (Action)null : delegate { OpenLenovo("/downloads/driver-list", "https://pcsupport.lenovo.com/"); });
             y += Px(46);
             using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, x, y, w, bottom - y);
             Txt(g, drvStatus(), fMono, T.Muted, new Rectangle(x, y, w, Px(20)));

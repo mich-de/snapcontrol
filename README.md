@@ -1,8 +1,8 @@
 # SnapControl
 
-Version 1.1.0
+Version 1.2.0
 
-A lightweight control panel for the **Lenovo IdeaPad Slim 5 14Q8X9 (83HL)** with **Snapdragon X Plus**, built as an alternative to Lenovo Vantage: native ARM64, no telemetry, a single executable of about 187 KB.
+A lightweight control panel for Lenovo laptops with **Snapdragon X**: the **IdeaPad Slim 5 14Q8X9 (83HL)** with Snapdragon X Plus and the **Yoga Slim 7 14Q8X9 (83ED)** with Snapdragon X Elite, built as an alternative to Lenovo Vantage: native ARM64, no telemetry, a single executable of about 187 KB.
 
 Author: **mich-de** — [github.com/mich-de/snapcontrol](https://github.com/mich-de/snapcontrol)
 
@@ -19,11 +19,11 @@ Author: **mich-de** — [github.com/mich-de/snapcontrol](https://github.com/mich
 - **Notification area** — with the `KEEP IN TRAY` check in the top bar, SnapControl stays in the notification area (icon with the percentage, tooltip with the battery life, menu with the power modes), the X hides the window instead of closing it, and the app starts with Windows (`--tray`). Clearing the check also removes the automatic start.
 - **Never sleep** — `NEVER SLEEP` check in the top bar: sleep and hibernation on idle are turned off, the network stays connected in modern standby (for example with the lid closed), and the Wi-Fi adapter runs at maximum performance. Clearing the check restores the previous values, saved when it was turned on.
 - **Drivers and BIOS** — list of installed third-party drivers, sortable by clicking the `DEVICE`, `PROVIDER`, `VERSION`, `DATE` and `AGE` column headers. `CHECK FOR UPDATES` searches three sources:
-  - **Windows Update**, where Lenovo publishes the certified drivers for the 83HL.
+  - **Windows Update**, where Lenovo publishes the certified drivers for the machine type.
   - The **pcsupport.lenovo.com download API**: the BIOS is shown only if it is newer than the installed one, with a link to the Lenovo package page.
   - The **Microsoft Update Catalog**: newer ARM64 drivers, including those published for other brands with the same hardware. It searches by device name and by PCI/USB ID, and Qualcomm devices with ACPI IDs are also searched as `QCOMxxxx`. A package is accepted only if it lists the device and is not older than the installed driver. These drivers are installed with pnputil and are not preselected. Before installing, the driver in use is exported to `%ProgramData%\SnapControl\backup`; the package is removed if Windows does not adopt it, and uninstalled if the device fails. Catalog pages are cached in `%LocalAppData%\SnapControl\catalog`, searches for 6 hours.
 
-  Install one at a time or in bulk (`INSTALL SELECTED`, `INSTALL ALL`), with an administrator prompt only at install time. `LENOVO 83HL PAGE` opens the Lenovo driver page for the 83HL.
+  Install one at a time or in bulk (`INSTALL SELECTED`, `INSTALL ALL`), with an administrator prompt only at install time. `LENOVO <TYPE> PAGE` opens the Lenovo driver page for this PC's machine type.
 
   A BIOS row is always visible on this page: `CHECK BIOS` asks Lenovo for the latest version and shows it next to the installed one. `DOWNLOAD` then saves that package, and `INSTALL` appears only when it is newer (same version prefix, higher number). The package is saved in `%LocalAppData%\SnapControl\bios` and accepted only if its SHA-256 matches the Lenovo API and its Authenticode signature is valid, not revoked and from Lenovo. `INSTALL` asks for confirmation, requires the charger and at least 30% battery, copies the package to a folder only administrators can write to, checks that copy and opens Lenovo's own installer window; there is no silent flash. BIOS settings return to defaults, the PC restarts, and Lenovo says not to go back to an earlier BIOS.
 
@@ -34,13 +34,17 @@ Author: **mich-de** — [github.com/mich-de/snapcontrol](https://github.com/mich
   - `POWER`: screen off, sleep, hibernate (if available), battery saver threshold, lid action and power button action, on AC and on battery, in the active power plan. While `NEVER SLEEP` is on, sleep and hibernate are read-only. "Never" for sleep on both AC and battery is set with the `NEVER SLEEP` check.
   - `APP USAGE`: each app's share of its own energy, excluding screen and losses, over the last 24 hours on battery. The data comes from `powercfg /srumutil` and is a Windows estimate: the figures are relative shares, not watts. It runs only when you press `REFRESH`, which asks for administrator permission, and the temporary file is deleted after reading.
 - **UAC** — the System page shows whether Windows asks for permission on this PC. Admin actions always go through the Windows prompt; there is no way around it for one app that does not create a privilege escalation path, so SnapControl offers none. Driver installs also ask for SnapControl's own confirmation.
+- **Device** — what Lenovo Vantage shows under its device settings, without Vantage (whose add-ins run under x64 emulation on these PCs). Three views:
+  - `DETAILS`: model, machine type, serial number, BIOS, mainboard, memory, storage, display panel and battery. `WARRANTY`, `SPARE PARTS` and `LENOVO SUPPORT` open this PC's pages on pcsupport.lenovo.com; to find them SnapControl asks the Lenovo product API, sending the serial number, only when one of these buttons is pressed. After that lookup the full model (for example `83ED0024IX`) is shown next to the machine type. `COPY SERIAL` copies the serial number.
+  - `AUDIO`: default speakers and microphone (Core Audio), volume, mute, left/right channel levels with `CENTER L/R` when they differ, `TEST L` / `TEST R` noise bursts on one speaker at a time, other active devices, and whether the Dolby Atmos and Elevoc noise-cancellation services are running.
+  - `NETWORK`: Wi-Fi adapter and connection (network, security, signal and RSSI, link rates, Wi-Fi standard, band, channel, access point), addresses, gateway and DNS of each active adapter, Bluetooth adapter status, and the Wi-Fi power saving of the active power plan on AC and battery.
 - **Two languages** — the window is in English (default) or Italian, switched with the `EN`/`IT` button in the top bar. The command-line output and the charge-limit log are in Italian only.
 
 ## Requirements
 
 **Nothing has to be changed in Windows and no library has to be installed for normal use.** No .NET download, Visual C++ runtime, kernel driver, test signing, Developer Mode or Secure Boot change.
 
-- **PC**: Lenovo IdeaPad Slim 5 14Q8X9 (83HL) is the only model tested. On other PCs the Lenovo, BIOS and charge-limit functions may not work.
+- **PC**: Lenovo IdeaPad Slim 5 14Q8X9 (83HL) is the model tested in full. The Yoga Slim 7 14Q8X9 (83ED, Snapdragon X Elite) is supported from 1.2.0: the machine type, the Lenovo pages and the top bar are read from the PC; the charge limit relies on the same Qualcomm battery driver family and is not yet tested on it. On other PCs the Lenovo, BIOS and charge-limit functions may not work.
 - **Windows**: Windows 11 ARM64, tested on build 26300. Native ARM64 needs 24H2 or later; on earlier versions the manifest setting is ignored and the app starts under x64 emulation (not tested).
 - **Runtime**: .NET Framework 4.8.1, already included in Windows 11 22H2 and later.
 - **Installer warning**: the installer is not code-signed, so SmartScreen may warn on a downloaded copy. Check its SHA-256 against the release page, then choose *More info › Run anyway*.
@@ -59,7 +63,7 @@ Some functions need more:
 ## Principles
 
 - **Native ARM64** — runs on the .NET Framework 4.8.1 ARM64 runtime included in Windows 11 (the manifest declares `supportedArchitectures`; without it Windows would start the app under x64 emulation).
-- **No telemetry, no automatic network use** — the only connections are the update search (Windows Update, Lenovo API, Microsoft catalog) and the downloads for the updates you choose to install. The search starts only when you press the button.
+- **No telemetry, no automatic network use** — the only connections are the update search (Windows Update, Lenovo API, Microsoft catalog), the downloads for the updates you choose to install and the Lenovo product lookup behind the Device page links. Each starts only when you press its button.
 - **Lightweight** — no background service unless the charge limit is on, no continuous animation (GPU idle), about 25 MB of private RAM.
 - **"Technical Minimal" style** — paper, thin lines, dot grid, orange LED, numbered mono labels; Light / Dark / Cactus themes based on [technical-minimal-web_2.0](https://github.com/mich-de/technical-minimal-web_2.0). System fonts: Cascadia Mono and Segoe UI Variable.
 
@@ -92,6 +96,7 @@ Options without the interface: `SnapControl.exe --report report.txt` (diagnostic
 |---|---|
 | `src/SnapControl.cs` | data (battery, system, drivers, Windows Update, Lenovo API, Snapdragon counters) and window |
 | `src/Ui.cs` | themes, dot matrix, title bar |
+| `src/Device.cs` | Device page data: details, Core Audio endpoints, WLAN API and network adapters |
 | `src/app.manifest` | per-monitor DPI, `asInvoker` execution, native ARM64 |
 | `src/Setup.cs`, `src/setup.manifest` | installer / uninstaller |
 | `src/app.ico` | icon (generated by `tools/MakeIcon.cs`) |
