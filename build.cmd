@@ -6,11 +6,15 @@ set "CSC=%WINDIR%\Microsoft.NET\FrameworkArm64\v4.0.30319\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 set "FW=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319"
 if not exist "%~dp0bin" mkdir "%~dp0bin"
+rem Optional: factory color profiles in a local "profiles" folder (git-ignored, they are Lenovo/X-Rite files)
+rem are built into the executable, so SnapControl can reinstall them even without X-Rite or its backup folder.
+set "RES="
+for %%f in ("%~dp0profiles\TPLCD_*.icm" "%~dp0profiles\TPLCD_*_Quality.txt") do call set RES=%%RES%% /resource:"%%~ff",profile/%%~nxf
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /langversion:5 /codepage:65001 ^
   /win32manifest:"%~dp0src\app.manifest" /win32icon:"%~dp0src\app.ico" ^
   /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
   /reference:System.Management.dll /reference:System.Core.dll /reference:Microsoft.CSharp.dll /reference:System.Web.Extensions.dll ^
-  /out:"%~dp0bin\SnapControl.exe" "%~dp0src\SnapControl.cs" "%~dp0src\Ui.cs" "%~dp0src\Device.cs" "%~dp0src\WifiGuard.cs"
+  %RES% /out:"%~dp0bin\SnapControl.exe" "%~dp0src\SnapControl.cs" "%~dp0src\Ui.cs" "%~dp0src\Device.cs" "%~dp0src\WifiGuard.cs"
 if errorlevel 1 exit /b %errorlevel%
 copy /y "%~dp0src\SnapControl.exe.config" "%~dp0bin\" >nul
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /langversion:5 /codepage:65001 ^

@@ -3600,7 +3600,13 @@ namespace SnapControl
                 PillButton(g, x, y, L.T("RESTORE PROFILES", "RIPRISTINA PROFILI"), false, colorBusy ? null : (Action)RestoreColor);
                 y += Px(52);
             }
-            else if (st.Saved > 0) { Note(g, x, y, w, L.T("Backup: ", "Copia di sicurezza: ") + st.Saved + L.T(" profiles in ", " profili in ") + ColorProfiles.BackupDir, T.Muted); y += Px(34); }
+            else if (st.Saved > 0 || st.Embedded > 0)
+            {
+                string where = st.Embedded > 0 ? st.Embedded + L.T(" profiles built into SnapControl", " profili integrati in SnapControl") + (st.Saved > 0 ? "  ·  " : "") : "";
+                if (st.Saved > 0) where += L.T("backup in ", "copia in ") + ColorProfiles.BackupDir;
+                Note(g, x, y, w, where, T.Muted);
+                y += Px(34);
+            }
 
             y = Section(g, x, y, w, "X-RITE COLOR ASSISTANT");
             if (xriteStart == null) { Note(g, x, y, w, L.T("Not installed: profiles stay applied by Windows", "Non installato: i profili restano applicati da Windows"), T.Muted); y += Px(30); }

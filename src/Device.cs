@@ -617,6 +617,7 @@ namespace SnapControl
             public bool AdvancedSupported, AdvancedOn, PerUser;
             public List<string> Files = new List<string>();     // file names, e.g. TPLCD_8AC2_sRGB.icm
             public int Saved;                                   // profiles in the backup
+            public int Embedded;                                // profiles built into SnapControl.exe
             public List<string> Missing = new List<string>();   // in the backup, no longer installed
         }
 
@@ -624,6 +625,31 @@ namespace SnapControl
         public static string BackupDir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SnapControl\color"); } }
 
         static readonly System.Text.RegularExpressions.Regex FileRx = new System.Text.RegularExpressions.Regex(@"^TPLCD_[0-9A-Fa-f]{4}_[A-Za-z0-9]+(\.icm|_Quality\.txt)$");
+
+        // Profiles built into this executable (build.cmd embeds the files of a local, git-ignored "profiles" folder
+        // as resources named "profile/<file>"): the copy survives even if the backup folder is deleted.
+        public static List<string> EmbeddedNames()
+        {
+            var res = new List<string>();
+            foreach (string n in System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceNames())
+                if (n.StartsWith("profile/", StringComparison.Ordinal) && FileRx.IsMatch(n.Substring(8))) res.Add(n);
+            return res;
+        }
+
+        // Writes the built-in profiles into the backup folder when they are missing there.
+        static void FromEmbedded()
+        {
+            var names = EmbeddedNames();
+            if (names.Count == 0) return;
+            System.IO.Directory.CreateDirectory(BackupDir);
+            foreach (string n in names)
+            {
+                string dst = System.IO.Path.Combine(BackupDir, n.Substring(8));
+                if (System.IO.File.Exists(dst)) continue;
+                using (var src = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(n))
+                using (var f = System.IO.File.Create(dst)) src.CopyTo(f);
+            }
+        }
 
         // Saves the panel's profiles and quality reports that are not saved yet (or changed).
         static void Backup(string code)
@@ -735,6 +761,8 @@ namespace SnapControl
                     foreach (string f in System.IO.Directory.GetFiles(Dir, "TPLCD_" + st.Code + "_*.icm"))
                         st.Files.Add(System.IO.Path.GetFileName(f));
                     try { Backup(st.Code); } catch { }
+                    try { FromEmbedded(); } catch { }
+                    foreach (string n in EmbeddedNames()) if (n.EndsWith(".icm", StringComparison.OrdinalIgnoreCase) && n.Substring(8).StartsWith("TPLCD_" + st.Code + "_", StringComparison.OrdinalIgnoreCase)) st.Embedded++;
                     if (System.IO.Directory.Exists(BackupDir))
                         foreach (string f in System.IO.Directory.GetFiles(BackupDir, "TPLCD_" + st.Code + "_*.icm"))
                         {
@@ -893,6 +921,7 @@ namespace SnapControl
                 sb.Append("pannello " + st.Panel + " · per utente " + st.PerUser + " · colore avanzato supportato " + st.AdvancedSupported + " attivo " + st.AdvancedOn + "\n");
                 sb.Append("predefinito SDR: " + st.Sdr + "\npredefinito avanzato: " + st.Advanced + "\n");
                 foreach (var f in st.Files) sb.Append((f.Equals(st.Sdr, StringComparison.OrdinalIgnoreCase) ? "* " : "  ") + f + "  (" + Label(Mode(f)) + ")\n");
+                sb.Append("integrati nell'app: " + st.Embedded + " profili\n");
                 sb.Append("copia di sicurezza: " + st.Saved + " profili in " + BackupDir + (st.Missing.Count > 0 ? " · mancanti: " + string.Join(", ", st.Missing) : "") + "\n");
                 var x = XRiteAtStartup();
                 sb.Append("X-Rite all'avvio: " + (x == null ? "attivita' assente" : x.Value ? "si" : "no") + "\n");
