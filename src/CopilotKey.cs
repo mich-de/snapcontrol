@@ -46,23 +46,36 @@ namespace SnapControl
             hook = IntPtr.Zero;
         }
 
+        static bool pending;   // F23 seen: the next real Win release must not open Start
+
         static IntPtr Hook(int code, IntPtr wParam, IntPtr lParam)
         {
             if (code >= 0)
             {
                 var k = (KBD)Marshal.PtrToStructure(lParam, typeof(KBD));
                 int msg = wParam.ToInt32();
+                bool injected = (k.Flags & 0x10) != 0;
+                bool down = msg == WmKeyDown || msg == WmSysKeyDown;
                 bool win = (GetAsyncKeyState(VkLWin) & 0x8000) != 0 || (GetAsyncKeyState(VkRWin) & 0x8000) != 0;
-                if (k.Vk == VkF23 && win && (k.Flags & 0x10) == 0)   // not injected
+                if (k.Vk == VkF23 && win && !injected)
                 {
-                    if (msg == WmKeyDown || msg == WmSysKeyDown)
+                    if (down)
                     {
-                        keybd_event(0xE8, 0, 0, UIntPtr.Zero);
-                        keybd_event(0xE8, 0, KeyUp, UIntPtr.Zero);
+                        pending = true;
                         var a = action;
                         if (a != null) a();
                     }
                     return new IntPtr(1);   // swallowed: Windows does not open Copilot/search
+                }
+                // Win released after the Copilot key: hold the real release back and replay it after a neutral
+                // key (0xE8), in that order, so the shell sees "Win + another key" and does not open Start.
+                if (pending && !down && !injected && (k.Vk == VkLWin || k.Vk == VkRWin))
+                {
+                    pending = false;
+                    keybd_event(0xE8, 0, 0, UIntPtr.Zero);
+                    keybd_event(0xE8, 0, KeyUp, UIntPtr.Zero);
+                    keybd_event((byte)k.Vk, 0, KeyUp | 1, UIntPtr.Zero);   // extended key, like the real Win key
+                    return new IntPtr(1);
                 }
             }
             return CallNextHookEx(hook, code, wParam, lParam);
