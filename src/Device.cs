@@ -585,3 +585,220 @@ namespace SnapControl
         }
     }
 }
+
+namespace SnapControl
+{
+    // ---------------------------------------------------------------------------------------- color
+
+    // Factory-calibrated panel profiles (TPLCD_<panel>_<name>.icm, installed with X-Rite Color Assistant) set as the
+    // display default through the Windows color APIs, the same switch X-Rite makes. Windows then loads the calibration
+    // itself (ICM\Calibration\CalibrationManagementEnabled), so X-Rite does not need to start with Windows.
+    static class ColorProfiles
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID { public uint Low; public int High; }
+
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint paths, IntPtr pathArray, ref uint modes, IntPtr modeArray, IntPtr topology);
+        [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(IntPtr packet);
+        [DllImport("mscms.dll", CharSet = CharSet.Unicode)] static extern int ColorProfileAddDisplayAssociation(int scope, string profile, LUID adapter, uint source, [MarshalAs(UnmanagedType.Bool)] bool setDefault, [MarshalAs(UnmanagedType.Bool)] bool advanced);
+        [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayDefault(int scope, LUID adapter, uint source, int type, int subtype, out IntPtr name);
+        [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayUserScope(LUID adapter, uint source, out int scope);
+        [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr mem);
+
+        const int CptIcc = 0, CpstStandard = 7, CpstExtended = 8;
+
+        public sealed class State
+        {
+            public string Panel = "", Code = "", Sdr = "", Advanced = "", Error;
+            public bool AdvancedSupported, AdvancedOn, PerUser;
+            public List<string> Files = new List<string>();     // file names, e.g. TPLCD_8AC2_sRGB.icm
+        }
+
+        static string Dir { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"spool\drivers\color"); } }
+
+        // The built-in panel: path whose target is internal/embedded, else the first active one.
+        static bool Target(out LUID adapter, out uint source, out LUID tAdapter, out uint target)
+        {
+            adapter = tAdapter = new LUID(); source = target = 0;
+            uint np, nm;
+            if (GetDisplayConfigBufferSizes(2, out np, out nm) != 0 || np == 0) return false;   // QDC_ONLY_ACTIVE_PATHS
+            IntPtr paths = Marshal.AllocHGlobal((int)np * 72), modes = Marshal.AllocHGlobal((int)nm * 64);
+            try
+            {
+                if (QueryDisplayConfig(2, ref np, paths, ref nm, modes, IntPtr.Zero) != 0 || np == 0) return false;
+                int pick = 0;
+                for (int i = 0; i < np; i++)
+                {
+                    uint tech = (uint)Marshal.ReadInt32(paths, i * 72 + 36);   // targetInfo.outputTechnology
+                    if (tech == 0x80000000 || tech == 11 || tech == 13) { pick = i; break; }   // internal, eDP, UDI embedded
+                }
+                int o = pick * 72;
+                adapter = new LUID { Low = (uint)Marshal.ReadInt32(paths, o), High = Marshal.ReadInt32(paths, o + 4) };
+                source = (uint)Marshal.ReadInt32(paths, o + 8);
+                tAdapter = new LUID { Low = (uint)Marshal.ReadInt32(paths, o + 20), High = Marshal.ReadInt32(paths, o + 24) };
+                target = (uint)Marshal.ReadInt32(paths, o + 28);
+                return true;
+            }
+            finally { Marshal.FreeHGlobal(paths); Marshal.FreeHGlobal(modes); }
+        }
+
+        static string Default(int scope, LUID a, uint s, int subtype)
+        {
+            IntPtr p;
+            if (ColorProfileGetDisplayDefault(scope, a, s, CptIcc, subtype, out p) != 0 || p == IntPtr.Zero) return "";
+            try { return Marshal.PtrToStringUni(p) ?? ""; }
+            finally { LocalFree(p); }
+        }
+
+        // e.g. "LEN8AC2" -> code "8AC2"
+        static string PanelId()
+        {
+            try
+            {
+                using (var s = new ManagementObjectSearcher(@"root\WMI", "SELECT InstanceName FROM WmiMonitorID"))
+                using (var res = s.Get())
+                    foreach (ManagementObject o in res)
+                        using (o)
+                        {
+                            string inst = Convert.ToString(o["InstanceName"]) ?? "";   // DISPLAY\LEN8AC2\...
+                            string[] p = inst.Split('\\');
+                            if (p.Length > 1 && p[1].Length >= 7) return p[1].ToUpperInvariant();
+                        }
+            }
+            catch { }
+            return "";
+        }
+
+        public static State Read()
+        {
+            var st = new State { Panel = PanelId() };
+            st.Code = st.Panel.Length >= 7 ? st.Panel.Substring(3) : "";
+            try
+            {
+                if (st.Code.Length > 0)
+                    foreach (string f in System.IO.Directory.GetFiles(Dir, "TPLCD_" + st.Code + "_*.icm"))
+                        st.Files.Add(System.IO.Path.GetFileName(f));
+                st.Files.Sort(StringComparer.OrdinalIgnoreCase);
+
+                LUID a, ta; uint s, t;
+                if (!Target(out a, out s, out ta, out t)) { st.Error = "QueryDisplayConfig"; return st; }
+                int scope;
+                if (ColorProfileGetDisplayUserScope(a, s, out scope) != 0) scope = 1;
+                st.PerUser = scope == 1;
+                st.Sdr = Default(scope, a, s, CpstStandard);
+                st.Advanced = Default(scope, a, s, CpstExtended);
+
+                // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO (type 9): header 20 bytes + value + encoding + bits
+                IntPtr pk = Marshal.AllocHGlobal(32);
+                try
+                {
+                    for (int i = 0; i < 32; i += 4) Marshal.WriteInt32(pk, i, 0);
+                    Marshal.WriteInt32(pk, 0, 9);
+                    Marshal.WriteInt32(pk, 4, 32);
+                    Marshal.WriteInt32(pk, 8, (int)ta.Low);
+                    Marshal.WriteInt32(pk, 12, ta.High);
+                    Marshal.WriteInt32(pk, 16, (int)t);
+                    if (DisplayConfigGetDeviceInfo(pk) == 0)
+                    {
+                        int v = Marshal.ReadInt32(pk, 20);
+                        st.AdvancedSupported = (v & 1) != 0;
+                        st.AdvancedOn = (v & 2) != 0;
+                    }
+                }
+                finally { Marshal.FreeHGlobal(pk); }
+            }
+            catch (Exception ex) { st.Error = ex.Message; }
+            return st;
+        }
+
+        // Sets the profile as the display default; also for advanced color when Windows uses it on this panel.
+        public static void Set(string file)
+        {
+            if (!System.Text.RegularExpressions.Regex.IsMatch(file, @"^TPLCD_[0-9A-Fa-f]{4}_[A-Za-z0-9]+\.icm$") || !System.IO.File.Exists(System.IO.Path.Combine(Dir, file)))
+                throw new ArgumentException(file);
+            LUID a, ta; uint s, t;
+            if (!Target(out a, out s, out ta, out t)) throw new Exception("QueryDisplayConfig");
+            int scope;
+            if (ColorProfileGetDisplayUserScope(a, s, out scope) != 0) scope = 1;
+            Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, false));
+            var st = Read();
+            if (st.AdvancedOn) Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, true));
+        }
+
+        // "TPLCD_8AC2_DisplayP3.icm" -> "DisplayP3"
+        public static string Mode(string file)
+        {
+            if (string.IsNullOrEmpty(file)) return "";
+            string n = System.IO.Path.GetFileNameWithoutExtension(file);
+            int i = n.IndexOf('_', 6);
+            return i > 0 ? n.Substring(i + 1) : n;
+        }
+
+        public static string Label(string mode)
+        {
+            switch (mode.ToLowerInvariant())
+            {
+                case "srgb": return "sRGB";
+                case "displayp3": return "DISPLAY P3";
+                case "dcip3": return "DCI-P3";
+                case "adobergb": return "ADOBE RGB";
+                case "rec709": return "REC.709";
+                case "default": return L.T("DEFAULT", "PREDEFINITO");
+                case "native": return L.T("NATIVE", "NATIVO");
+                default: return mode.ToUpperInvariant();
+            }
+        }
+
+        // ------------------------------------------------ X-Rite Color Assistant at sign-in
+
+        public const string Task = "XRiteColorAssistantStartup";
+
+        // true / false, null if the task does not exist or cannot be read
+        public static bool? XRiteAtStartup()
+        {
+            try
+            {
+                dynamic svc = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service"));
+                svc.Connect();
+                dynamic t = svc.GetFolder("\\").GetTask(Task);
+                return (bool)t.Enabled;
+            }
+            catch { return null; }
+        }
+
+        // The task belongs to the installer (SYSTEM): changing it needs administrator rights.
+        public static void SetXRiteAtStartup(bool on)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("schtasks.exe", "/Change /TN \"" + Task + "\" " + (on ? "/ENABLE" : "/DISABLE"))
+            { Verb = "runas", UseShellExecute = true, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden };
+            using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
+            if (!on)
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName("XRiteColorAssistant"))
+                    try { p.Kill(); } catch { } finally { p.Dispose(); }
+        }
+
+        // ------------------------------------------------ command line (tests without the window)
+
+        public static int Cli(string[] a)
+        {
+            var sb = new StringBuilder();
+            int code = 0;
+            try
+            {
+                if (a.Length == 2 && a[0] == "--color-set") Set(a[1]);
+                else if (a.Length != 1) return 1;
+                var st = Read();
+                sb.Append("pannello " + st.Panel + " · per utente " + st.PerUser + " · colore avanzato supportato " + st.AdvancedSupported + " attivo " + st.AdvancedOn + "\n");
+                sb.Append("predefinito SDR: " + st.Sdr + "\npredefinito avanzato: " + st.Advanced + "\n");
+                foreach (var f in st.Files) sb.Append((f.Equals(st.Sdr, StringComparison.OrdinalIgnoreCase) ? "* " : "  ") + f + "  (" + Label(Mode(f)) + ")\n");
+                var x = XRiteAtStartup();
+                sb.Append("X-Rite all'avvio: " + (x == null ? "attivita' assente" : x.Value ? "si" : "no") + "\n");
+                if (st.Error != null) { sb.Append("errore: " + st.Error + "\n"); code = 2; }
+            }
+            catch (Exception ex) { sb.Append("errore: " + ex.Message + "\n"); code = 1; }
+            try { PowerSettings.Send(PowerSettings.StdOut, sb.ToString()); } catch { return 1; }
+            return code;
+        }
+    }
+}

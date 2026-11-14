@@ -2154,7 +2154,10 @@ namespace SnapControl
         bool ctlApps;                                          // Controls page: per-app usage view
         bool appBusy;
         List<string[]> appRows;
-        int devView;                                           // Device page: 0 details, 1 audio, 2 network
+        int devView;                                           // Device page: 0 details, 1 audio, 2 network, 3 color
+        ColorProfiles.State colorSt;
+        bool? xriteStart;
+        bool colorBusy;
         List<string[]> devRows, audioProc, ifRows;
         List<Audio.Endpoint> audioEps;
         List<NetInfo.Wifi> wifi;
@@ -2200,7 +2203,7 @@ namespace SnapControl
                 if (page == 1 && Visible && WindowState != FormWindowState.Minimized) Invalidate();
                 if (page == 4 && ctlPower && Visible && WindowState != FormWindowState.Minimized) { RefreshPower(); Invalidate(); }
                 // audio and Wi-Fi change outside the app (keys, flyout, roaming): reread while visible
-                if (page == 6 && devView > 0 && Visible && WindowState != FormWindowState.Minimized) { RefreshDevice(); Invalidate(); }
+                if (page == 6 && (devView == 1 || devView == 2) && Visible && WindowState != FormWindowState.Minimized) { RefreshDevice(); Invalidate(); }
             };
             liveTimer.Tick += delegate { if (page == 3 && Visible && WindowState != FormWindowState.Minimized) RefreshSoc(); };
             Shown += delegate { Init(); Invalidate(); };
@@ -3297,6 +3300,11 @@ namespace SnapControl
                 catch (Exception ex) { audioEps = new List<Audio.Endpoint>(); devStatus = () => L.T("Audio unreadable: ", "Audio non leggibile: ") + ex.Message; }
                 if (audioProc == null) audioProc = Audio.Processing();
             }
+            else if (devView == 3)
+            {
+                colorSt = ColorProfiles.Read();
+                xriteStart = ColorProfiles.XRiteAtStartup();
+            }
             else
             {
                 wifi = NetInfo.ReadWifi();
@@ -3353,13 +3361,15 @@ namespace SnapControl
 
         void PaintDevice(Graphics g, int x, int y, int w)
         {
-            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null)) RefreshDevice();
+            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null) || (devView == 3 && colorSt == null)) RefreshDevice();
             int sx = PillButton(g, x, y, L.T("DETAILS", "DETTAGLI"), devView == 0, delegate { devView = 0; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, "AUDIO", devView == 1, delegate { devView = 1; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
-            PillButton(g, sx, y, L.T("NETWORK", "RETE"), devView == 2, delegate { devView = 2; devStatus = () => ""; RefreshDevice(); });
+            sx = PillButton(g, sx, y, L.T("NETWORK", "RETE"), devView == 2, delegate { devView = 2; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
+            PillButton(g, sx, y, L.T("COLOR", "COLORE"), devView == 3, delegate { devView = 3; devStatus = () => ""; RefreshDevice(); });
             y += Px(46);
             if (devView == 0) y = PaintDetails(g, x, y, w);
             else if (devView == 1) y = PaintAudio(g, x, y, w);
+            else if (devView == 3) y = PaintColor(g, x, y, w);
             else y = PaintNetwork(g, x, y, w);
             string st = devStatus();
             if (st.Length > 0) Note(g, x, y, w, st, T.Muted);
@@ -3439,6 +3449,72 @@ namespace SnapControl
                 y = Rows(g, x, y, w, audioProc.ConvertAll(r => new[] { r[0], L.T(r[3], r[1]), r[2] })) + Px(12);
             PillButton(g, x, y, L.T("SOUND SETTINGS ↗", "IMPOSTAZIONI AUDIO ↗"), false, delegate { Open("ms-settings:sound"); });
             return y + Px(46);
+        }
+
+        void SetColor(string file)
+        {
+            try { ColorProfiles.Set(file); devStatus = () => L.T("Color profile set: ", "Profilo colore impostato: ") + ColorProfiles.Label(ColorProfiles.Mode(file)); }
+            catch (Exception ex) { devStatus = () => L.T("Could not change the color profile: ", "Impossibile cambiare il profilo colore: ") + ex.Message; }
+            RefreshDevice();
+        }
+
+        void SetXRite(bool on)
+        {
+            if (colorBusy) return;
+            colorBusy = true;
+            Background(delegate
+            {
+                string err = null;
+                try { ColorProfiles.SetXRiteAtStartup(on); }
+                catch (System.ComponentModel.Win32Exception) { err = L.T("administrator permission not granted", "permesso di amministratore non concesso"); }
+                catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    colorBusy = false;
+                    if (err != null) devStatus = () => "X-Rite: " + err;
+                    RefreshDevice();
+                    Invalidate();
+                });
+            });
+        }
+
+        int PaintColor(Graphics g, int x, int y, int w)
+        {
+            var st = colorSt;
+            var rows = new List<string[]>
+            {
+                new[] { "Pannello", st.Panel + (st.Code.Length > 0 ? "  ·  " + st.Files.Count + L.T(" factory profiles", " profili di fabbrica") : ""), "Panel" },
+                new[] { "Profilo attivo", st.Sdr.Length > 0 ? ColorProfiles.Label(ColorProfiles.Mode(st.Sdr)) + "  ·  " + st.Sdr : L.T("none (Windows default)", "nessuno (predefinito di Windows)"), "Active profile" },
+            };
+            if (st.AdvancedSupported)
+                rows.Add(new[] { "Colore avanzato", (st.AdvancedOn ? L.T("on", "attivo") : L.T("off", "spento")) + (st.AdvancedOn && st.Advanced.Length > 0 ? "  ·  " + st.Advanced : ""), "Advanced color" });
+            y = Rows(g, x, y, w, rows) + Px(18);
+
+            y = Section(g, x, y, w, L.T("COLOR MODE · FACTORY-CALIBRATED PROFILES (X-RITE)", "MODALITÀ COLORE · PROFILI CALIBRATI IN FABBRICA (X-RITE)"));
+            if (st.Files.Count == 0) { Note(g, x, y, w, L.T("No factory profiles for this panel", "Nessun profilo di fabbrica per questo pannello"), T.Muted); y += Px(30); }
+            else
+            {
+                int bx = x;
+                foreach (string f in st.Files)
+                {
+                    string file = f, label = ColorProfiles.Label(ColorProfiles.Mode(f));
+                    if (bx > x && bx + TxtW(label, fMono) + Px(36) > x + w) { bx = x; y += Px(42); }
+                    bx = PillButton(g, bx, y, label, file.Equals(st.Sdr, StringComparison.OrdinalIgnoreCase), delegate { SetColor(file); }).Right + Px(8);
+                }
+                y += Px(52);
+            }
+
+            y = Section(g, x, y, w, "X-RITE COLOR ASSISTANT");
+            if (xriteStart == null) { Note(g, x, y, w, L.T("Not installed: profiles stay applied by Windows", "Non installato: i profili restano applicati da Windows"), T.Muted); y += Px(30); }
+            else
+            {
+                string[] n = { L.T("YES", "SÌ"), L.T("NO", "NO") };
+                uint[] v = { 1, 0 };
+                y = ControlRow(g, x, y, w, L.T("STARTS WITH WINDOWS", "PARTE CON WINDOWS"), n, v, xriteStart.Value ? 1u : 0u, colorBusy ? null : (Action<uint>)(val => SetXRite(val == 1)), 200, 28);
+                Note(g, x, y, w, L.T("Not needed: Windows loads the chosen profile and its calibration at sign-in", "Non serve: Windows carica da solo il profilo scelto e la sua calibrazione all'accesso"), T.Muted);
+                y += Px(26);
+            }
+            return y + Px(8);
         }
 
         int PaintNetwork(Graphics g, int x, int y, int w)
@@ -3644,6 +3720,11 @@ namespace SnapControl
             if (args.Length > 0 && args[0].StartsWith("--power-"))
             {
                 Environment.ExitCode = PowerSettings.Cli(args);
+                return;
+            }
+            if (args.Length > 0 && args[0].StartsWith("--color"))
+            {
+                Environment.ExitCode = ColorProfiles.Cli(args);
                 return;
             }
             if (args.Length > 0 && args[0].StartsWith("--app-usage"))
