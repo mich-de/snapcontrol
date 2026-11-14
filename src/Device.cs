@@ -309,6 +309,22 @@ namespace SnapControl
             finally { Release(d); Release(en); }
         }
 
+        // Mute of the default endpoint (null without one): read often by the key indicator, kept light.
+        public static bool? DefaultMute(int flow)
+        {
+            var en = Enumerator();
+            IMMDevice d = null;
+            try
+            {
+                if (en.GetDefaultAudioEndpoint(flow, Multimedia, out d) != 0 || d == null) return null;
+                var v = Volume(d);
+                try { bool m; return v.GetMute(out m) == 0 ? (bool?)m : null; }
+                finally { Release(v); }
+            }
+            catch { return null; }
+            finally { Release(d); Release(en); }
+        }
+
         public static void SetVolume(string id, int pct)
         {
             With(id, v => { Guid ctx = Guid.Empty; Check(v.SetMasterVolumeLevelScalar(pct / 100f, ref ctx)); });
@@ -930,6 +946,129 @@ namespace SnapControl
             catch (Exception ex) { sb.Append("errore: " + ex.Message + "\n"); code = 1; }
             try { PowerSettings.Send(PowerSettings.StdOut, sb.ToString()); } catch { return 1; }
             return code;
+        }
+    }
+}
+
+namespace SnapControl
+{
+    // The two Lenovo services kept after removing Vantage: Fn keys (Fn+Q, mic mute, backlight) and the
+    // Lenovo Dispatcher that talks to the firmware. Read with WMI; start/restart needs administrator rights.
+    static class LenovoServices
+    {
+        public class Svc
+        {
+            public string Name, It, En, State = "", StartMode = "", DeviceId, DeviceStatus = "";
+            public uint Pid;
+            public bool Exists, Running { get { return State == "Running"; } }
+        }
+
+        static readonly string[][] Known =
+        {
+            new[] { "LenovoFnAndFunctionKeys", "Tasti Fn e Fn+Q", "Fn keys and Fn+Q", "ACPI\\\\IDEA200E\\\\%" },
+            new[] { "LenovoProcessManagement", "Lenovo Dispatcher (firmware)", "Lenovo Dispatcher (firmware)", "ACPI\\\\IDEA200D\\\\%" },
+        };
+
+        public static bool IsKnown(string name)
+        {
+            foreach (var k in Known) if (k[0].Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        public static List<Svc> Read()
+        {
+            var list = new List<Svc>();
+            foreach (var k in Known)
+            {
+                var s = new Svc { Name = k[0], It = k[1], En = k[2] };
+                try
+                {
+                    using (var q = new ManagementObjectSearcher("SELECT State, StartMode, ProcessId FROM Win32_Service WHERE Name='" + k[0] + "'"))
+                        foreach (ManagementObject o in q.Get())
+                            using (o)
+                            {
+                                s.Exists = true;
+                                s.State = (string)o["State"] ?? "";
+                                s.StartMode = (string)o["StartMode"] ?? "";
+                                s.Pid = o["ProcessId"] == null ? 0 : (uint)o["ProcessId"];
+                            }
+                    using (var q = new ManagementObjectSearcher("SELECT DeviceID, Status FROM Win32_PnPEntity WHERE DeviceID LIKE '" + k[3] + "'"))
+                        foreach (ManagementObject o in q.Get())
+                            using (o) { s.DeviceId = (string)o["DeviceID"]; s.DeviceStatus = (string)o["Status"] ?? ""; }
+                }
+                catch { }
+                list.Add(s);
+            }
+            return list;
+        }
+
+        public static string StateText(Svc s)
+        {
+            if (!s.Exists) return L.T("not installed", "non installato");
+            string st = s.State == "Running" ? L.T("running", "in esecuzione") : s.State == "Stopped" ? L.T("stopped", "fermo")
+                : s.State.EndsWith("Pending") ? L.T("starting/stopping", "in avvio/arresto") : s.State;
+            string mode = s.StartMode == "Auto" ? L.T("automatic", "automatico") : s.StartMode == "Manual" ? L.T("manual", "manuale")
+                : s.StartMode == "Disabled" ? L.T("disabled", "disattivato") : s.StartMode;
+            string dev = s.DeviceId == null ? L.T("device missing", "dispositivo assente") : s.DeviceStatus == "OK" ? L.T("device OK", "dispositivo OK") : L.T("device ", "dispositivo ") + s.DeviceStatus;
+            return st + " · " + mode + (s.Pid > 0 ? " · PID " + s.Pid : "") + " · " + dev;
+        }
+
+        // Started by the window with runas: sets the service to automatic, stops it if running and starts it again.
+        public static void Restart(string name)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(System.Windows.Forms.Application.ExecutablePath, "--lenovo-svc-restart " + name)
+            { Verb = "runas", UseShellExecute = true, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden };
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                p.WaitForExit();
+                if (p.ExitCode != 0) throw new Exception(L.T("the service did not start (code ", "il servizio non è partito (codice ") + p.ExitCode + ")");
+            }
+        }
+
+        static ManagementObject Get(string name)
+        {
+            return new ManagementObject("Win32_Service.Name='" + name + "'");
+        }
+
+        static string State(string name)
+        {
+            using (var o = Get(name)) { o.Get(); return (string)o["State"]; }
+        }
+
+        static bool WaitFor(string name, string state, int seconds)
+        {
+            for (int i = 0; i < seconds * 4; i++)
+            {
+                if (State(name) == state) return true;
+                System.Threading.Thread.Sleep(250);
+            }
+            return false;
+        }
+
+        public static int Cli(string[] a)
+        {
+            if (a.Length == 2 && a[0] == "--lenovo-svc-restart")
+            {
+                if (!IsKnown(a[1])) return 2;
+                try
+                {
+                    using (var o = Get(a[1]))
+                    {
+                        o.Get();
+                        if ((string)o["StartMode"] != "Auto") o.InvokeMethod("ChangeStartMode", new object[] { "Automatic" });
+                        if ((string)o["State"] != "Stopped") { o.InvokeMethod("StopService", null); WaitFor(a[1], "Stopped", 20); }
+                        o.InvokeMethod("StartService", null);
+                    }
+                    return WaitFor(a[1], "Running", 20) ? 0 : 3;
+                }
+                catch { return 1; }
+            }
+            // read-only: --lenovo-svc
+            var sb = new StringBuilder();
+            foreach (var s in Read()) sb.Append(s.Name + ": " + StateText(s) + "\n");
+            Console.Write(sb.ToString());
+            System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "snapcontrol-lenovo-svc.txt"), sb.ToString());
+            return 0;
         }
     }
 }

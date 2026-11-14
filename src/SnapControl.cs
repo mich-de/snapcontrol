@@ -341,6 +341,21 @@ namespace SnapControl
             }
         }
 
+        // On-screen indicator for the special keys: on if missing.
+        public static bool Osd
+        {
+            get
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(Key)) return k == null || Convert.ToInt32(k.GetValue("Osd", 1)) == 1; }
+                catch { return true; }
+            }
+            set
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Key)) k.SetValue("Osd", value ? 1 : 0); }
+                catch { }
+            }
+        }
+
         // Window language: English if missing.
         public static bool Italian
         {
@@ -2157,7 +2172,16 @@ namespace SnapControl
         bool ctlApps;                                          // Controls page: per-app usage view
         bool appBusy;
         List<string[]> appRows;
-        int devView;                                           // Device page: 0 details, 1 audio, 2 network, 3 color, 4 security
+        int devView;                                           // Device page: 0 details, 1 audio, 2 network, 3 color, 4 security, 5 keys
+        List<LenovoServices.Svc> lenovoSvc;
+        bool svcBusy;
+        string svcAlerted = "";
+        Osd osd;
+        readonly Timer osdTimer = new Timer { Interval = 150 };
+        bool? osdMic;
+        bool osdCaps, osdNum, osdReady;
+        Guid osdMode;
+        int osdTick;
         WifiGuard.Result guard;
         List<WifiGuard.Item> httpsItems;
         bool httpsBusy, guardSaved, guardTrayBusy;
@@ -2231,11 +2255,13 @@ namespace SnapControl
                 UpdateTray();
                 if (page == 1 && Visible && WindowState != FormWindowState.Minimized) Invalidate();
                 if (page == 4 && ctlPower && Visible && WindowState != FormWindowState.Minimized) { RefreshPower(); Invalidate(); }
-                if (trayMode && tray != null && ++guardTick % 6 == 0) GuardTray();
+                if (trayMode && tray != null && ++guardTick % 6 == 0) { GuardTray(); SvcTray(); }
                 // audio and Wi-Fi change outside the app (keys, flyout, roaming): reread while visible
                 if (page == 6 && (devView == 1 || devView == 2) && Visible && WindowState != FormWindowState.Minimized) { RefreshDevice(); Invalidate(); }
             };
             liveTimer.Tick += delegate { if (page == 3 && Visible && WindowState != FormWindowState.Minimized) RefreshSoc(); };
+            osdTimer.Tick += delegate { WatchKeys(); };
+            if (Settings.Osd) osdTimer.Start();
             Shown += delegate { Init(); Invalidate(); };
             if (trayMode) CreateTray();
         }
@@ -3359,6 +3385,7 @@ namespace SnapControl
                 try { guard = WifiGuard.Check(true); }
                 catch (Exception ex) { guard = new WifiGuard.Result(); devStatus = () => ex.Message; }
             }
+            else if (devView == 5) lenovoSvc = LenovoServices.Read();
             else if (devView == 3)
             {
                 colorSt = ColorProfiles.Read();
@@ -3420,17 +3447,19 @@ namespace SnapControl
 
         void PaintDevice(Graphics g, int x, int y, int w)
         {
-            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null) || (devView == 3 && colorSt == null) || (devView == 4 && guard == null)) RefreshDevice();
+            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null) || (devView == 3 && colorSt == null) || (devView == 4 && guard == null) || (devView == 5 && lenovoSvc == null)) RefreshDevice();
             int sx = PillButton(g, x, y, L.T("DETAILS", "DETTAGLI"), devView == 0, delegate { devView = 0; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, "AUDIO", devView == 1, delegate { devView = 1; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, L.T("NETWORK", "RETE"), devView == 2, delegate { devView = 2; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, L.T("COLOR", "COLORE"), devView == 3, delegate { devView = 3; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
-            PillButton(g, sx, y, L.T("SECURITY", "SICUREZZA"), devView == 4, delegate { devView = 4; devStatus = () => ""; httpsItems = null; RefreshDevice(); });
+            sx = PillButton(g, sx, y, L.T("SECURITY", "SICUREZZA"), devView == 4, delegate { devView = 4; devStatus = () => ""; httpsItems = null; RefreshDevice(); }).Right + Px(8);
+            PillButton(g, sx, y, L.T("KEYS", "TASTI"), devView == 5, delegate { devView = 5; devStatus = () => ""; RefreshDevice(); });
             y += Px(46);
             if (devView == 0) y = PaintDetails(g, x, y, w);
             else if (devView == 1) y = PaintAudio(g, x, y, w);
             else if (devView == 3) y = PaintColor(g, x, y, w);
             else if (devView == 4) y = PaintSecurity(g, x, y, w);
+            else if (devView == 5) y = PaintKeys(g, x, y, w);
             else y = PaintNetwork(g, x, y, w);
             string st = devStatus();
             if (st.Length > 0) Note(g, x, y, w, st, T.Muted);
@@ -3619,6 +3648,125 @@ namespace SnapControl
                 y += Px(26);
             }
             return y + Px(8);
+        }
+
+        // ---------------------------------------------------------------- keys: on-screen indicator and Lenovo services
+
+        // Polls the key states (cheap calls) and shows the indicator on a change; the first read only records them.
+        void WatchKeys()
+        {
+            bool caps = Control.IsKeyLocked(Keys.CapsLock), num = Control.IsKeyLocked(Keys.NumLock);
+            Guid mode = PowerMode.Current();
+            bool? mic = osdMic;
+            if (++osdTick % 2 == 0 || !osdReady) mic = Audio.DefaultMute(Audio.Capture);
+            if (osdReady)
+            {
+                if (mic != null && osdMic != null && mic != osdMic)
+                    ShowOsd(OsdIcon.Mic, mic.Value ? L.T("Microphone off", "Microfono spento") : L.T("Microphone on", "Microfono acceso"), L.T("Fn · mic key", "Fn · tasto microfono"), mic.Value, -1, 0);
+                else if (mode != osdMode)
+                {
+                    int lv = mode == PowerMode.Efficiency ? 1 : mode == PowerMode.Performance ? 3 : 2;
+                    ShowOsd(OsdIcon.Mode, PowerMode.Name(mode), L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q"), mode == PowerMode.Performance, lv, 3);
+                }
+                else if (caps != osdCaps)
+                    ShowOsd(OsdIcon.Caps, caps ? L.T("Caps Lock on", "Maiuscole attive") : L.T("Caps Lock off", "Maiuscole disattivate"), "Caps Lock", caps, -1, 0);
+                else if (num != osdNum)
+                    ShowOsd(OsdIcon.Num, num ? L.T("Num Lock on", "Bloc Num attivo") : L.T("Num Lock off", "Bloc Num disattivato"), "Num Lock", num, -1, 0);
+            }
+            osdMic = mic; osdCaps = caps; osdNum = num; osdMode = mode; osdReady = true;
+        }
+
+        void ShowOsd(OsdIcon icon, string title, string sub, bool on, int level, int steps)
+        {
+            if (osd == null || osd.IsDisposed) osd = new Osd(() => T);
+            osd.Show(icon, title, sub, on, level, steps);
+        }
+
+        void ToggleOsd()
+        {
+            Settings.Osd = !Settings.Osd;
+            if (Settings.Osd) { osdReady = false; osdTimer.Start(); } else osdTimer.Stop();
+            Invalidate();
+        }
+
+        int PaintKeys(Graphics g, int x, int y, int w)
+        {
+            y = Section(g, x, y, w, L.T("ON-SCREEN INDICATOR", "INDICATORE A SCHERMO"));
+            bool osdOn = Settings.Osd;
+            int bx = PillButton(g, x, y, osdOn ? L.T("ON", "ATTIVO") : L.T("OFF", "SPENTO"), osdOn, ToggleOsd).Right + Px(16);
+            Txt(g, L.T("Preview:", "Anteprima:"), fMonoSmall, T.Muted, new Rectangle(bx, y, Px(90), Px(34)));
+            bx += Px(96);
+            Action<string, Action> pv = (label, act) =>
+            {
+                if (bx + TxtW(label, fMono) + Px(36) > x + w) { bx = x + Px(120); y += Px(42); }
+                bx = PillButton(g, bx, y, label, false, act).Right + Px(8);
+            };
+            pv(L.T("MIC", "MICROFONO"), delegate { ShowOsd(OsdIcon.Mic, L.T("Microphone off", "Microfono spento"), L.T("Fn · mic key", "Fn · tasto microfono"), true, -1, 0); });
+            pv(L.T("BACKLIGHT", "RETROILLUMINAZIONE"), delegate { ShowOsd(OsdIcon.Backlight, L.T("Keyboard backlight", "Retroilluminazione tastiera"), L.T("Level 2 of 2", "Livello 2 di 2"), true, 2, 2); });
+            pv("FN+Q", delegate { ShowOsd(OsdIcon.Mode, PowerMode.Name(PowerMode.Performance), L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q"), true, 3, 3); });
+            pv("CAPS", delegate { ShowOsd(OsdIcon.Caps, L.T("Caps Lock on", "Maiuscole attive"), "Caps Lock", true, -1, 0); });
+            y += Px(46);
+            Note(g, x, y, w, L.T("Shown when the microphone, Fn+Q, Caps Lock or Num Lock change, while SnapControl runs", "Compare quando cambiano microfono, Fn+Q, Maiuscole o Bloc Num, finché SnapControl è aperto"), T.Muted);
+            y += Px(40);
+
+            y = Section(g, x, y, w, L.T("LENOVO SERVICES", "SERVIZI LENOVO"));
+            foreach (var s in lenovoSvc)
+            {
+                int h = Px(52);
+                using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, h));
+                Led(g, x + Px(8), y + h / 2, s.Running);
+                Txt(g, L.T(s.En, s.It), fBody, T.Text, new Rectangle(x + Px(26), y + Px(4), w - Px(180), Px(24)));
+                Txt(g, s.Name + " · " + LenovoServices.StateText(s), fMonoSmall, s.Running ? T.Muted : T.Accent, new Rectangle(x + Px(26), y + Px(28), w - Px(180), Px(20)));
+                string name = s.Name;
+                if (s.Exists)
+                    PillButton(g, x + w - Px(150), y + Px(9), s.Running ? L.T("RESTART", "RIAVVIA") : L.T("START", "AVVIA"), !s.Running, svcBusy ? (Action)null : delegate { RestartSvc(name); });
+                y += h;
+                HLine(g, x, x + w, y, T.Line);
+            }
+            y += Px(12);
+            Note(g, x, y, w, L.T("They handle the Fn keys: if one stops, restart it here (asks for administrator)", "Gestiscono i tasti Fn: se uno si ferma, riavvialo da qui (chiede l'amministratore)"), T.Muted);
+            return y + Px(30);
+        }
+
+        void RestartSvc(string name)
+        {
+            svcBusy = true;
+            devStatus = () => L.T("Restarting ", "Riavvio di ") + name + "…";
+            Invalidate();
+            Background(delegate
+            {
+                string err = null;
+                try { LenovoServices.Restart(name); }
+                catch (System.ComponentModel.Win32Exception) { err = L.T("administrator permission not granted", "permesso di amministratore non concesso"); }
+                catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    svcBusy = false;
+                    devStatus = err == null ? (Func<string>)(() => name + L.T(" restarted", " riavviato")) : () => name + ": " + err;
+                    RefreshDevice();
+                    Invalidate();
+                });
+            });
+        }
+
+        // With the icon near the clock: a stopped Lenovo service shows a notification once.
+        void SvcTray()
+        {
+            Background(delegate
+            {
+                List<LenovoServices.Svc> list;
+                try { list = LenovoServices.Read(); } catch { return; }
+                var down = list.FindAll(s => s.Exists && !s.Running);
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    string key = string.Join(",", down.ConvertAll(s => s.Name));
+                    if (key == svcAlerted) return;
+                    svcAlerted = key;
+                    if (down.Count > 0 && tray != null)
+                        tray.ShowBalloonTip(15000, L.T("SnapControl · Lenovo service stopped", "SnapControl · servizio Lenovo fermo"),
+                            string.Join(", ", down.ConvertAll(s => L.T(s.En, s.It))) + L.T(": Fn keys may not work. Open Device › Keys to restart it.", ": i tasti Fn potrebbero non funzionare. Apri Dispositivo › Tasti per riavviarlo."), ToolTipIcon.Warning);
+                });
+            });
         }
 
         // ---------------------------------------------------------------- Wi-Fi security
@@ -3982,6 +4130,11 @@ namespace SnapControl
             if (args.Length > 0 && (args[0] == "--wifi-guard" || args[0] == "--net-public"))
             {
                 Environment.ExitCode = WifiGuard.Cli(args);
+                return;
+            }
+            if (args.Length > 0 && args[0].StartsWith("--lenovo-svc"))
+            {
+                Environment.ExitCode = LenovoServices.Cli(args);
                 return;
             }
             if (args.Length > 0 && args[0].StartsWith("--color"))

@@ -14,7 +14,7 @@ for %%f in ("%~dp0profiles\TPLCD_*.icm" "%~dp0profiles\TPLCD_*_Quality.txt") do 
   /win32manifest:"%~dp0src\app.manifest" /win32icon:"%~dp0src\app.ico" ^
   /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
   /reference:System.Management.dll /reference:System.Core.dll /reference:Microsoft.CSharp.dll /reference:System.Web.Extensions.dll ^
-  %RES% /out:"%~dp0bin\SnapControl.exe" "%~dp0src\SnapControl.cs" "%~dp0src\Ui.cs" "%~dp0src\Device.cs" "%~dp0src\WifiGuard.cs"
+  %RES% /out:"%~dp0bin\SnapControl.exe" "%~dp0src\SnapControl.cs" "%~dp0src\Ui.cs" "%~dp0src\Device.cs" "%~dp0src\WifiGuard.cs" "%~dp0src\Osd.cs"
 if errorlevel 1 exit /b %errorlevel%
 copy /y "%~dp0src\SnapControl.exe.config" "%~dp0bin\" >nul
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /langversion:5 /codepage:65001 ^
