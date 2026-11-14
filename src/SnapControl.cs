@@ -2154,7 +2154,12 @@ namespace SnapControl
         bool ctlApps;                                          // Controls page: per-app usage view
         bool appBusy;
         List<string[]> appRows;
-        int devView;                                           // Device page: 0 details, 1 audio, 2 network, 3 color
+        int devView;                                           // Device page: 0 details, 1 audio, 2 network, 3 color, 4 security
+        WifiGuard.Result guard;
+        List<WifiGuard.Item> httpsItems;
+        bool httpsBusy, guardSaved, guardTrayBusy;
+        string guardAlerted = "";
+        int guardTick;
         ColorProfiles.State colorSt;
         bool? xriteStart;
         bool colorBusy;
@@ -2202,6 +2207,7 @@ namespace SnapControl
                 UpdateTray();
                 if (page == 1 && Visible && WindowState != FormWindowState.Minimized) Invalidate();
                 if (page == 4 && ctlPower && Visible && WindowState != FormWindowState.Minimized) { RefreshPower(); Invalidate(); }
+                if (trayMode && tray != null && ++guardTick % 6 == 0) GuardTray();
                 // audio and Wi-Fi change outside the app (keys, flyout, roaming): reread while visible
                 if (page == 6 && (devView == 1 || devView == 2) && Visible && WindowState != FormWindowState.Minimized) { RefreshDevice(); Invalidate(); }
             };
@@ -3300,6 +3306,11 @@ namespace SnapControl
                 catch (Exception ex) { audioEps = new List<Audio.Endpoint>(); devStatus = () => L.T("Audio unreadable: ", "Audio non leggibile: ") + ex.Message; }
                 if (audioProc == null) audioProc = Audio.Processing();
             }
+            else if (devView == 4)
+            {
+                try { guard = WifiGuard.Check(true); }
+                catch (Exception ex) { guard = new WifiGuard.Result(); devStatus = () => ex.Message; }
+            }
             else if (devView == 3)
             {
                 colorSt = ColorProfiles.Read();
@@ -3361,15 +3372,17 @@ namespace SnapControl
 
         void PaintDevice(Graphics g, int x, int y, int w)
         {
-            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null) || (devView == 3 && colorSt == null)) RefreshDevice();
+            if ((devView == 0 && devRows == null) || (devView == 1 && audioEps == null) || (devView == 2 && wifi == null) || (devView == 3 && colorSt == null) || (devView == 4 && guard == null)) RefreshDevice();
             int sx = PillButton(g, x, y, L.T("DETAILS", "DETTAGLI"), devView == 0, delegate { devView = 0; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, "AUDIO", devView == 1, delegate { devView = 1; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
             sx = PillButton(g, sx, y, L.T("NETWORK", "RETE"), devView == 2, delegate { devView = 2; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
-            PillButton(g, sx, y, L.T("COLOR", "COLORE"), devView == 3, delegate { devView = 3; devStatus = () => ""; RefreshDevice(); });
+            sx = PillButton(g, sx, y, L.T("COLOR", "COLORE"), devView == 3, delegate { devView = 3; devStatus = () => ""; RefreshDevice(); }).Right + Px(8);
+            PillButton(g, sx, y, L.T("SECURITY", "SICUREZZA"), devView == 4, delegate { devView = 4; devStatus = () => ""; httpsItems = null; RefreshDevice(); });
             y += Px(46);
             if (devView == 0) y = PaintDetails(g, x, y, w);
             else if (devView == 1) y = PaintAudio(g, x, y, w);
             else if (devView == 3) y = PaintColor(g, x, y, w);
+            else if (devView == 4) y = PaintSecurity(g, x, y, w);
             else y = PaintNetwork(g, x, y, w);
             string st = devStatus();
             if (st.Length > 0) Note(g, x, y, w, st, T.Muted);
@@ -3552,6 +3565,159 @@ namespace SnapControl
                 y += Px(26);
             }
             return y + Px(8);
+        }
+
+        // ---------------------------------------------------------------- Wi-Fi security
+
+        // With the icon near the clock: a danger on the current network shows a notification once per network/finding.
+        void GuardTray()
+        {
+            if (guardTrayBusy) return;
+            guardTrayBusy = true;
+            Background(delegate
+            {
+                WifiGuard.Result r = null;
+                try { r = WifiGuard.Check(false); } catch { }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    guardTrayBusy = false;
+                    if (r == null || tray == null || !r.Connected || r.Worst < 2) return;
+                    var first = r.Items.Find(i => i.Level == 2);
+                    string text = first.Text(), key = r.Ssid + "|" + r.Bssid + "|" + text;
+                    if (key == guardAlerted) return;
+                    guardAlerted = key;
+                    tray.ShowBalloonTip(15000, "SnapControl · Wi-Fi «" + r.Ssid + "»", text.Length > 250 ? text.Substring(0, 250) + "…" : text, ToolTipIcon.Warning);
+                });
+            });
+        }
+
+        void CheckHttps()
+        {
+            if (httpsBusy) return;
+            httpsBusy = true;
+            httpsItems = null;
+            devStatus = () => L.T("Checking HTTPS certificates of microsoft.com and google.com…", "Verifica dei certificati HTTPS di microsoft.com e google.com…");
+            Background(delegate
+            {
+                List<WifiGuard.Item> res;
+                try { res = WifiGuard.Https(); }
+                catch (Exception ex) { string m = ex.Message; res = new List<WifiGuard.Item> { new WifiGuard.Item(1, () => m) }; }
+                BeginInvoke((MethodInvoker)delegate { httpsBusy = false; httpsItems = res; devStatus = () => ""; Invalidate(); });
+            });
+        }
+
+        void GuardAdmin(string what, Action a)
+        {
+            Background(delegate
+            {
+                string err = null;
+                try { a(); }
+                catch (System.ComponentModel.Win32Exception) { err = L.T("administrator permission not granted", "permesso di amministratore non concesso"); }
+                catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    devStatus = err == null ? (Func<string>)(() => what) : () => what + ": " + err;
+                    RefreshDevice();
+                    Invalidate();
+                });
+            });
+        }
+
+        // Findings with wrapped text: a badge on the left, the full sentence on the right.
+        int Findings(Graphics g, int x, int y, int w, List<WifiGuard.Item> items)
+        {
+            int labelW = Px(130);
+            HLine(g, x, x + w, y, T.Line);
+            foreach (var it in items)
+            {
+                string text = it.Text();
+                const TextFormatFlags wrap = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding | TextFormatFlags.Left;
+                int th = TextRenderer.MeasureText(text, fBody, new Size(w - labelW - Px(8), 0), wrap).Height;
+                int h = Math.Max(Px(34), th + Px(14));
+                using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y + 1, w, h - 1));
+                Led(g, x + Px(6), y + Px(17), it.Level > 0);
+                string badge = it.Level == 2 ? L.T("DANGER", "RISCHIO") : it.Level == 1 ? L.T("WARNING", "ATTENZIONE") : "OK";
+                Txt(g, badge, fMonoSmall, it.Level > 0 ? T.Accent : T.Muted, new Rectangle(x + Px(18), y, labelW - Px(18), Px(34)));
+                TextRenderer.DrawText(g, text, fBody, new Rectangle(x + labelW, y + Px(7), w - labelW - Px(8), th), T.Text, wrap);
+                y += h;
+                HLine(g, x, x + w, y, T.Line);
+            }
+            return y;
+        }
+
+        int PaintSecurity(Graphics g, int x, int y, int w)
+        {
+            var r = guard;
+            if (!r.Connected)
+            {
+                Note(g, x, y, w, L.T("Not connected to Wi-Fi", "Non connesso al Wi-Fi") + (r.Adapter.Length > 0 ? "  ·  " + r.Adapter : ""), T.Muted);
+                y += Px(30);
+            }
+            else
+            {
+                int worst = r.Worst;
+                string head = worst == 2 ? L.T("AT RISK", "A RISCHIO") : worst == 1 ? L.T("CHECK", "DA CONTROLLARE") : L.T("PROTECTED", "PROTETTA");
+                using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, Px(30)));
+                Led(g, x + Px(6), y + Px(14), worst > 0);
+                Txt(g, "«" + r.Ssid + "»  ·  " + head, fMonoBold, worst > 0 ? T.Accent : T.Text, new Rectangle(x + Px(20), y, w - Px(20), Px(28)));
+                y += Px(30);
+                Note(g, x, y, w, r.Security + "  ·  " + L.T("router ", "router ") + r.Gateway + " " + r.GatewayMac + "  ·  DNS " + string.Join(", ", r.Dns), T.Muted);
+                y += Px(30);
+            }
+            y = Findings(g, x, y, w, r.Items) + Px(10);
+            if (httpsItems != null && httpsItems.Count > 0) y = Findings(g, x, y, w, httpsItems) + Px(10);
+
+            int bx = x;
+            Action<string, Action> pill = (label, act) =>
+            {
+                if (bx > x && bx + TxtW(label, fMono) + Px(36) > x + w) { bx = x; y += Px(42); }
+                bx = PillButton(g, bx, y, label, false, act).Right + Px(8);
+            };
+            pill(L.T("REFRESH", "AGGIORNA"), delegate { httpsItems = null; RefreshDevice(); });
+            if (r.Connected) pill(httpsBusy ? L.T("CHECKING…", "VERIFICA…") : L.T("CHECK HTTPS", "VERIFICA HTTPS"), httpsBusy ? (Action)null : CheckHttps);
+            if (r.Connected && r.Changed) pill(L.T("TRUST THIS NETWORK", "FIDATI DI QUESTA RETE"), delegate { WifiGuard.Trust(r); devStatus = () => L.T("Router and DNS remembered as they are now", "Router e DNS memorizzati come sono ora"); RefreshDevice(); });
+            if (r.Connected && r.Category == 1)
+            {
+                string name = r.Profile.Length > 0 ? r.Profile : r.Ssid;
+                if (name.IndexOf('"') < 0)
+                    pill(L.T("SET AS PUBLIC", "IMPOSTA PUBBLICA"), delegate
+                    {
+                        GuardAdmin(L.T("Network set as Public", "Rete impostata come pubblica"), delegate
+                        {
+                            var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--net-public \"" + name + "\"") { Verb = "runas", UseShellExecute = true };
+                            using (var p = System.Diagnostics.Process.Start(psi)) { p.WaitForExit(); if (p.ExitCode != 0) throw new Exception(L.T("network not found", "rete non trovata")); }
+                        });
+                    });
+            }
+            pill(guardSaved ? L.T("HIDE SAVED NETWORKS", "NASCONDI RETI SALVATE") : L.T("SAVED NETWORKS · ", "RETI SALVATE · ") + r.Profiles.Count, delegate { guardSaved = !guardSaved; });
+            y += Px(46);
+
+            if (guardSaved)
+            {
+                var list = new List<WifiGuard.Saved>(r.Profiles);
+                list.Sort((a, b) => (b.Open && b.Auto).CompareTo(a.Open && a.Auto));
+                int shown = 0;
+                foreach (var p in list)
+                {
+                    if (shown++ >= 8) { Note(g, x, y, w, L.T("… and ", "… e altre ") + (list.Count - 8), T.Muted); y += Px(26); break; }
+                    string line = p.Ssid + "  ·  " + (p.Auth.Length > 0 ? p.Auth : "?") + (p.Encryption.Length > 0 && p.Encryption != "none" ? "/" + p.Encryption : "") + "  ·  " + (p.Auto ? L.T("joins automatically", "si collega da sola") : L.T("only when chosen", "solo se scelta")) + (p.Random.Length > 0 ? "  ·  " + p.Random : "");
+                    using (var bg = new SolidBrush(T.Bg)) g.FillRectangle(bg, new Rectangle(x, y, w, Px(34)));
+                    Led(g, x + Px(6), y + Px(17), p.Open && p.Auto);
+                    int tx = x + Px(20), tw = w - Px(20);
+                    if (p.Open && p.Auto)
+                    {
+                        string prof = p.Name, label = L.T("ONLY WHEN CHOSEN", "SOLO SE SCELTA");
+                        int pw = TxtW(label, fMono) + Px(28);
+                        PillButton(g, x + w - pw, y, label, false, delegate { GuardAdmin(L.T("«" + prof + "» now joins only when chosen", "«" + prof + "» ora si collega solo se scelta"), delegate { WifiGuard.SetManual(prof); }); }, 28);
+                        tw -= pw + Px(8);
+                    }
+                    Txt(g, line, fMono, T.Text, new Rectangle(tx, y, tw, Px(34)));
+                    y += Px(38);
+                }
+                pill = null;
+            }
+            Note(g, x, y, w, L.T("Local checks · router and DNS remembered on this PC · HTTPS check only on request", "Controlli locali · router e DNS ricordati su questo PC · verifica HTTPS solo a richiesta"), T.Muted);
+            return y + Px(26);
         }
 
         int PaintNetwork(Graphics g, int x, int y, int w)
@@ -3757,6 +3923,11 @@ namespace SnapControl
             if (args.Length > 0 && args[0].StartsWith("--power-"))
             {
                 Environment.ExitCode = PowerSettings.Cli(args);
+                return;
+            }
+            if (args.Length > 0 && (args[0] == "--wifi-guard" || args[0] == "--net-public"))
+            {
+                Environment.ExitCode = WifiGuard.Cli(args);
                 return;
             }
             if (args.Length > 0 && args[0].StartsWith("--color"))
