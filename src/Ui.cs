@@ -114,5 +114,12 @@ namespace SnapControl
             int txt = t.Text.R | (t.Text.G << 8) | (t.Text.B << 16);
             DwmSetWindowAttribute(hwnd, 36, ref txt, 4);                                 // DWMWA_TEXT_COLOR
         }
+
+        // Hidden from the screen by DWM while the window keeps working (no white frame while it paints).
+        public static void Cloak(IntPtr hwnd, bool on)
+        {
+            int v = on ? 1 : 0;
+            DwmSetWindowAttribute(hwnd, 13, ref v, 4);                                   // DWMWA_CLOAK
+        }
     }
 }

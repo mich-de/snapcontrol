@@ -2256,6 +2256,7 @@ namespace SnapControl
             Text = "SnapControl";
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }   // app.ico embedded by build.cmd
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+            BackColor = T.Bg;   // the first frame and any erase use the theme color, not the light system gray
             AutoScaleMode = AutoScaleMode.None;
             StartPosition = FormStartPosition.CenterScreen;
             dpi = SystemDpi();
@@ -2330,8 +2331,12 @@ namespace SnapControl
 
         public void ShowWindow()
         {
+            // Cloaked until the first full paint: otherwise DWM shows a white frame for an instant.
+            bool wasHidden = !Visible || WindowState == FormWindowState.Minimized;
+            if (wasHidden && IsHandleCreated) Dwm.Cloak(Handle, true);
             Show();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            if (wasHidden) { Refresh(); Dwm.Cloak(Handle, false); }
             Activate();
         }
 
@@ -2913,6 +2918,7 @@ namespace SnapControl
             themeIdx = (themeIdx + 1) % Theme.All.Length;
             Theme.Save(themeIdx);
             Dwm.TitleBar(Handle, T);
+            BackColor = T.Bg;
         }
 
         // ---------------------------------------------------------------- drawing
