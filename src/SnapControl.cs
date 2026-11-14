@@ -2177,7 +2177,7 @@ namespace SnapControl
         bool svcBusy;
         string svcAlerted = "";
         Osd osd;
-        readonly Timer osdTimer = new Timer { Interval = 150 };
+        readonly System.Windows.Forms.Timer osdTimer = new System.Windows.Forms.Timer { Interval = 150 };
         bool? osdMic;
         bool osdCaps, osdNum, osdReady;
         Guid osdMode;
@@ -2862,6 +2862,8 @@ namespace SnapControl
                 {
                     var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--charge-limit " + (level == 0 ? "off" : level.ToString())) { Verb = "runas", UseShellExecute = true };
                     using (var p = System.Diagnostics.Process.Start(psi)) p.WaitForExit();
+                    if (Settings.Osd && ChargeLimit.Enabled == (level != 0) && (level == 0 || ChargeLimit.Stop == level))
+                        BeginInvoke((MethodInvoker)delegate { ChargeOsd(level); });
                 }
                 catch (System.ComponentModel.Win32Exception) { }   // administrator permission not granted
                 BeginInvoke((MethodInvoker)delegate { chargeBusy = false; Invalidate(); });
@@ -3663,17 +3665,26 @@ namespace SnapControl
             {
                 if (mic != null && osdMic != null && mic != osdMic)
                     ShowOsd(OsdIcon.Mic, mic.Value ? L.T("Microphone off", "Microfono spento") : L.T("Microphone on", "Microfono acceso"), L.T("Fn · mic key", "Fn · tasto microfono"), mic.Value, -1, 0);
-                else if (mode != osdMode)
-                {
-                    int lv = mode == PowerMode.Efficiency ? 1 : mode == PowerMode.Performance ? 3 : 2;
-                    ShowOsd(OsdIcon.Mode, PowerMode.Name(mode), L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q"), mode == PowerMode.Performance, lv, 3);
-                }
+                else if (mode != osdMode) ModeOsd(mode, L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q"));
                 else if (caps != osdCaps)
                     ShowOsd(OsdIcon.Caps, caps ? L.T("Caps Lock on", "Maiuscole attive") : L.T("Caps Lock off", "Maiuscole disattivate"), "Caps Lock", caps, -1, 0);
                 else if (num != osdNum)
                     ShowOsd(OsdIcon.Num, num ? L.T("Num Lock on", "Bloc Num attivo") : L.T("Num Lock off", "Bloc Num disattivato"), "Num Lock", num, -1, 0);
             }
             osdMic = mic; osdCaps = caps; osdNum = num; osdMode = mode; osdReady = true;
+        }
+
+        void ModeOsd(Guid mode, string sub)
+        {
+            int lv = mode == PowerMode.Efficiency ? 1 : mode == PowerMode.Performance ? 3 : 2;
+            ShowOsd(OsdIcon.Mode, PowerMode.Name(mode), sub, mode == PowerMode.Performance, lv, 3);
+        }
+
+        // level 0 = limit off
+        void ChargeOsd(int level)
+        {
+            if (level == 0) ShowOsd(OsdIcon.Battery, L.T("Charge limit off", "Limite di carica spento"), L.T("Charges to 100% · SnapControl", "Carica fino al 100% · SnapControl"), false, 10, 10);
+            else ShowOsd(OsdIcon.Battery, L.T("Charge limit ", "Limite di carica ") + level + "%", L.T("Battery care · SnapControl", "Cura batteria · SnapControl"), true, level / 10, 10);
         }
 
         void ShowOsd(OsdIcon icon, string title, string sub, bool on, int level, int steps)
@@ -3703,7 +3714,8 @@ namespace SnapControl
             };
             pv(L.T("MIC", "MICROFONO"), delegate { ShowOsd(OsdIcon.Mic, L.T("Microphone off", "Microfono spento"), L.T("Fn · mic key", "Fn · tasto microfono"), true, -1, 0); });
             pv(L.T("BACKLIGHT", "RETROILLUMINAZIONE"), delegate { ShowOsd(OsdIcon.Backlight, L.T("Keyboard backlight", "Retroilluminazione tastiera"), L.T("Level 2 of 2", "Livello 2 di 2"), true, 2, 2); });
-            pv("FN+Q", delegate { ShowOsd(OsdIcon.Mode, PowerMode.Name(PowerMode.Performance), L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q"), true, 3, 3); });
+            pv("FN+Q", delegate { ModeOsd(PowerMode.Performance, L.T("Power mode · Fn+Q", "Modalità energia · Fn+Q")); });
+            pv(L.T("CHARGE", "CARICA"), delegate { ChargeOsd(80); });
             pv("CAPS", delegate { ShowOsd(OsdIcon.Caps, L.T("Caps Lock on", "Maiuscole attive"), "Caps Lock", true, -1, 0); });
             y += Px(46);
             Note(g, x, y, w, L.T("Shown when the microphone, Fn+Q, Caps Lock or Num Lock change, while SnapControl runs", "Compare quando cambiano microfono, Fn+Q, Maiuscole o Bloc Num, finché SnapControl è aperto"), T.Muted);
@@ -3962,6 +3974,7 @@ namespace SnapControl
         void SetMode(Guid m)
         {
             uint r = Native.PowerSetActiveOverlayScheme(ref m);
+            if (r == 0 && Settings.Osd) { osdMode = m; ModeOsd(m, L.T("Power mode · SnapControl", "Modalità energia · SnapControl")); }
             if (r != 0) MessageBox.Show(this, L.T("Could not change mode (error " + r + ").", "Impossibile cambiare modalità (errore " + r + ")."), "SnapControl");
             RefreshBattery();
         }

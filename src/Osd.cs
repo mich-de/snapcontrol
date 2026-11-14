@@ -11,7 +11,7 @@ using System.Windows.Forms;
 
 namespace SnapControl
 {
-    enum OsdIcon { Mic, Backlight, Mode, Caps, Num }
+    enum OsdIcon { Mic, Backlight, Mode, Caps, Num, Battery }
 
     sealed class Osd : Form
     {
@@ -198,6 +198,16 @@ namespace SnapControl
                         float mx = r.X + s * 0.5f, my = r.Y + s * 0.6f;
                         g.DrawLine(p, mx, my, mx + (float)Math.Cos(a) * s * 0.4f, my - (float)Math.Sin(a) * s * 0.4f);
                         g.FillEllipse(b, mx - lw * 1.2f, my - lw * 1.2f, lw * 2.4f, lw * 2.4f);
+                        break;
+                    case OsdIcon.Battery:
+                        // outline, terminal on the right, fill that follows the animated level
+                        var body = new RectangleF(r.X, r.Y + s * 0.24f, s * 0.86f, s * 0.52f);
+                        using (var bp = Round(body, s * 0.1f)) g.DrawPath(p, bp);
+                        g.DrawLine(p, body.Right + s * 0.08f, body.Y + body.Height * 0.32f, body.Right + s * 0.08f, body.Bottom - body.Height * 0.32f);
+                        float fr = steps > 0 ? Math.Max(0, Math.Min(1, shownLevel / steps)) : 1;
+                        float inset = lw * 1.4f;
+                        if (fr > 0)
+                            using (var fp = Round(new RectangleF(body.X + inset, body.Y + inset, (body.Width - inset * 2) * fr, body.Height - inset * 2), s * 0.05f)) g.FillPath(b, fp);
                         break;
                     case OsdIcon.Caps:
                     case OsdIcon.Num:

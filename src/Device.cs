@@ -960,7 +960,8 @@ namespace SnapControl
         {
             public string Name, It, En, State = "", StartMode = "", DeviceId, DeviceStatus = "";
             public uint Pid;
-            public bool Exists, Running { get { return State == "Running"; } }
+            public bool Exists;
+            public bool Running { get { return State == "Running"; } }
         }
 
         static readonly string[][] Known =
