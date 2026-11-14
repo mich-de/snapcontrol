@@ -106,6 +106,9 @@ namespace SnapControl
             public int BitsPerPel, PelsWidth, PelsHeight, DisplayFlags, DisplayFrequency;
             public int ICMMethod, ICMIntent, MediaType, DitherType, Reserved1, Reserved2, PanningWidth, PanningHeight;
         }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -2180,7 +2183,27 @@ namespace SnapControl
         Font fMono, fMonoBold, fMonoSmall, fTitle, fBody;
 
         Theme T { get { return Theme.All[themeIdx]; } }
-        float S { get { return DeviceDpi / 96f; } }
+        // Real DPI of the window. Control.DeviceDpi stays 96 in .NET Framework unless the WinForms high-DPI mode is
+        // configured, so on a 200% panel everything was drawn at half size: ask Windows directly (PerMonitorV2 manifest).
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern uint GetDpiForSystem();
+        int dpi = 96;
+        float S { get { return dpi / 96f; } }
+
+        static int SystemDpi()
+        {
+            try { uint d = GetDpiForSystem(); return d >= 96 ? (int)d : 96; } catch { return 96; }
+        }
+
+        // Window size for the current DPI, within the work area of its screen.
+        void FitSize()
+        {
+            var wa = Screen.FromHandle(Handle).WorkingArea;
+            ClientSize = new Size(Px(1000), Px(820));
+            if (Height > wa.Height) Height = wa.Height;
+            if (Width > wa.Width) Width = wa.Width;
+            MinimumSize = new Size(Math.Min(Px(680), wa.Width), Math.Min(Px(480), wa.Height));
+        }
         int Px(float v) { return (int)Math.Round(v * S); }
 
         public MainForm() : this(false) { }
@@ -2193,6 +2216,7 @@ namespace SnapControl
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
             AutoScaleMode = AutoScaleMode.None;
             StartPosition = FormStartPosition.CenterScreen;
+            dpi = SystemDpi();
             MakeFonts();
             ClientSize = new Size(Px(1000), Px(820));
             // do not exceed the screen work area (e.g. 1920x1200 at 150% = 1280x752 usable)
@@ -2401,13 +2425,37 @@ namespace SnapControl
         {
             base.OnHandleCreated(e);
             Dwm.TitleBar(Handle, T);
+            int d = 0;
+            try { d = (int)GetDpiForWindow(Handle); } catch { }
+            if (d >= 96 && d != dpi)
+            {
+                dpi = d;
+                MakeFonts();
+                inkCache.Clear();
+                FitSize();
+            }
+        }
+
+        // WM_DPICHANGED: moved to a screen with another scale; Windows suggests the new window rectangle.
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg != 0x02E0) return;
+            int d = (int)((long)m.WParam & 0xFFFF);
+            if (d < 96 || d == dpi) return;
+            dpi = d;
+            MakeFonts();
+            inkCache.Clear();
+            var rc = (Native.RECT)Marshal.PtrToStructure(m.LParam, typeof(Native.RECT));
+            Bounds = new Rectangle(rc.Left, rc.Top, rc.Right - rc.Left, rc.Bottom - rc.Top);
+            trayIconKey = null;
+            UpdateTray();
+            Invalidate();
         }
 
         protected override void OnDpiChanged(DpiChangedEventArgs e)
         {
-            base.OnDpiChanged(e);
-            MakeFonts();
-            Invalidate();
+            base.OnDpiChanged(e);   // handled in WndProc with the real DPI
         }
 
         // ---------------------------------------------------------------- data
