@@ -602,6 +602,8 @@ namespace SnapControl
         [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint paths, IntPtr pathArray, ref uint modes, IntPtr modeArray, IntPtr topology);
         [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(IntPtr packet);
         [DllImport("mscms.dll", CharSet = CharSet.Unicode)] static extern int ColorProfileAddDisplayAssociation(int scope, string profile, LUID adapter, uint source, [MarshalAs(UnmanagedType.Bool)] bool setDefault, [MarshalAs(UnmanagedType.Bool)] bool advanced);
+        [DllImport("mscms.dll", CharSet = CharSet.Unicode)] static extern int ColorProfileSetDisplayDefaultAssociation(int scope, string profile, int type, int subtype, LUID adapter, uint source);
+        [DllImport("mscms.dll", CharSet = CharSet.Unicode)] static extern int ColorProfileRemoveDisplayAssociation(int scope, string profile, LUID adapter, uint source, [MarshalAs(UnmanagedType.Bool)] bool advanced);
         [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayDefault(int scope, LUID adapter, uint source, int type, int subtype, out IntPtr name);
         [DllImport("mscms.dll")] static extern int ColorProfileGetDisplayUserScope(LUID adapter, uint source, out int scope);
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr mem);
@@ -790,8 +792,23 @@ namespace SnapControl
             if (!Target(out a, out s, out ta, out t)) throw new Exception("QueryDisplayConfig");
             int scope;
             if (ColorProfileGetDisplayUserScope(a, s, out scope) != 0) scope = 1;
-            Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, false));
-            if (AdvancedOn()) Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, true));
+            // Add only associates a profile that is already associated: it does not make it the default again.
+            // SetDisplayDefaultAssociation does; if Windows still reports another default, re-associate from scratch.
+            ColorProfileAddDisplayAssociation(scope, file, a, s, true, false);
+            Marshal.ThrowExceptionForHR(ColorProfileSetDisplayDefaultAssociation(scope, file, CptIcc, CpstStandard, a, s));
+            if (!Default(scope, a, s, CpstStandard).Equals(file, StringComparison.OrdinalIgnoreCase))
+            {
+                ColorProfileRemoveDisplayAssociation(scope, file, a, s, false);
+                Marshal.ThrowExceptionForHR(ColorProfileAddDisplayAssociation(scope, file, a, s, true, false));
+            }
+            if (AdvancedOn())
+            {
+                ColorProfileAddDisplayAssociation(scope, file, a, s, true, true);
+                Marshal.ThrowExceptionForHR(ColorProfileSetDisplayDefaultAssociation(scope, file, CptIcc, CpstExtended, a, s));
+            }
+            string now = Default(scope, a, s, CpstStandard);
+            if (!now.Equals(file, StringComparison.OrdinalIgnoreCase))
+                throw new Exception(L.T("Windows still uses ", "Windows usa ancora ") + (now.Length > 0 ? now : "?"));
             try { using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Settings.Key)) k.SetValue("ColorProfile", file); } catch { }
         }
 
