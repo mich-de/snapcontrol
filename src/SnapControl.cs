@@ -66,6 +66,9 @@ namespace SnapControl
 
         [DllImport("powrprof.dll")]
         public static extern uint PowerGetEffectiveOverlayScheme(out Guid scheme);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hwnd);
         // The GUID must be passed by reference: by value it works on x64 only by accident (structs >8 bytes
         // are passed via pointer), on ARM64 it lands in registers and the DLL reads an invalid address.
         [DllImport("powrprof.dll")]
@@ -352,6 +355,21 @@ namespace SnapControl
             set
             {
                 try { using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Key)) k.SetValue("Osd", value ? 1 : 0); }
+                catch { }
+            }
+        }
+
+        // Copilot key opens SnapControl: on if missing.
+        public static bool CopilotKey
+        {
+            get
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(Key)) return k == null || Convert.ToInt32(k.GetValue("CopilotKey", 1)) == 1; }
+                catch { return true; }
+            }
+            set
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Key)) k.SetValue("CopilotKey", value ? 1 : 0); }
                 catch { }
             }
         }
@@ -2262,6 +2280,7 @@ namespace SnapControl
             liveTimer.Tick += delegate { if (page == 3 && Visible && WindowState != FormWindowState.Minimized) RefreshSoc(); };
             osdTimer.Tick += delegate { WatchKeys(); };
             if (Settings.Osd) osdTimer.Start();
+            if (Settings.CopilotKey) CopilotKey.Start(CopilotPressed);
             Shown += delegate { Init(); Invalidate(); };
             if (trayMode) CreateTray();
         }
@@ -2302,6 +2321,7 @@ namespace SnapControl
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            CopilotKey.Stop();
             DisposeTray();
             base.OnFormClosed(e);
         }
@@ -3693,6 +3713,23 @@ namespace SnapControl
             osd.Show(icon, title, sub, on, level, steps);
         }
 
+        // Copilot key: opens SnapControl, or hides it to the tray when it is already in front.
+        void CopilotPressed()
+        {
+            BeginInvoke((MethodInvoker)delegate
+            {
+                if (Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this && trayMode) Hide();
+                else { ShowWindow(); Native.SetForegroundWindow(Handle); }
+            });
+        }
+
+        void ToggleCopilotKey()
+        {
+            Settings.CopilotKey = !Settings.CopilotKey;
+            if (Settings.CopilotKey) CopilotKey.Start(CopilotPressed); else CopilotKey.Stop();
+            Invalidate();
+        }
+
         void ToggleOsd()
         {
             Settings.Osd = !Settings.Osd;
@@ -3720,6 +3757,13 @@ namespace SnapControl
             y += Px(46);
             Note(g, x, y, w, L.T("Shown when the microphone, Fn+Q, Caps Lock or Num Lock change, while SnapControl runs", "Compare quando cambiano microfono, Fn+Q, Maiuscole o Bloc Num, finché SnapControl è aperto"), T.Muted);
             y += Px(40);
+
+            y = Section(g, x, y, w, L.T("COPILOT KEY", "TASTO COPILOT"));
+            bool ck = Settings.CopilotKey;
+            int cx = PillButton(g, x, y, ck ? L.T("OPENS SNAPCONTROL", "APRE SNAPCONTROL") : L.T("WINDOWS DEFAULT", "PREDEFINITO WINDOWS"), ck, ToggleCopilotKey).Right + Px(16);
+            Txt(g, ck ? (CopilotKey.Active ? L.T("Press it to open SnapControl, again to hide it", "Premilo per aprire SnapControl, di nuovo per nasconderlo") : L.T("Key hook not available", "Aggancio del tasto non disponibile"))
+                      : L.T("Windows decides (Copilot or search)", "Decide Windows (Copilot o ricerca)"), fMonoSmall, T.Muted, new Rectangle(cx, y, x + w - cx, Px(34)));
+            y += Px(56);
 
             y = Section(g, x, y, w, L.T("LENOVO SERVICES", "SERVIZI LENOVO"));
             foreach (var s in lenovoSvc)
