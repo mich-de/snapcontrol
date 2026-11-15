@@ -11,7 +11,7 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SnapControl Setup")]
 [assembly: AssemblyCompany("mich-de")]
 [assembly: AssemblyCopyright("mich-de - github.com/mich-de/snapcontrol")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8.1", FrameworkDisplayName = ".NET Framework 4.8.1")]
 
 namespace SnapControl.Setup
@@ -170,7 +170,7 @@ namespace SnapControl.Setup
             lnk.TargetPath = Exe;
             lnk.WorkingDirectory = Dir;
             lnk.IconLocation = Exe + ",0";
-            lnk.Description = "Battery, power and drivers for IdeaPad Slim 5 14Q8X9";
+            lnk.Description = "Battery, power, drivers and device settings for Lenovo Snapdragon X laptops";
             lnk.Save();
         }
     }

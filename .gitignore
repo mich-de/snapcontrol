@@ -8,3 +8,6 @@ handover.md
 memory.md
 riprendi-dopo-riavvio.md
 cleanroom/
+
+# Factory color profiles (Lenovo/X-Rite files): embedded only in local builds
+profiles/
